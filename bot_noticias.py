@@ -174,3 +174,31 @@ def iniciar_bot():
 
 if __name__ == "__main__":
     iniciar_bot()
+def iniciar_bot():
+    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+    
+    enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia) en servidor gratuito.")
+    
+    # ==========================================
+    # 🧪 PRUEBA TEMPORAL DE ALERTA EN 1 MINUTO
+    # ==========================================
+    hora_prueba = datetime.now(COLOMBIA_TZ) + timedelta(minutes=1)
+    evento_prueba = {
+        "event": "CPI m/m (PRUEBA)",
+        "currency": "USD",
+        "hora_formateada": hora_prueba.strftime("%I:%M %p")
+    }
+    scheduler.add_job(
+        enviar_alerta_15_min,
+        'date',
+        run_date=hora_prueba,
+        args=[evento_prueba]
+    )
+    print(f"Alerta de prueba programada para las: {hora_prueba.strftime('%I:%M:%S %p')}")
+    # ==========================================
+
+    procesar_rutina_diaria()
+    scheduler.add_job(procesar_rutina_diaria, 'cron', hour=6, minute=0)
+    
+    print("Bot corriendo 24/7...")
+    scheduler.start()
