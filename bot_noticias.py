@@ -26,30 +26,35 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot de Noticias activo 24/7 en Render Free Tier")
 
     def log_message(self, format, *args):
-        return  # Desactiva logs molestos de HTTP en la consola
+        return  # Desactiva logs molestos en consola
 
 def iniciar_servidor_web():
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"Servidor web escuchando en el puerto {port} (Render Free Tier Activo)")
+    print(f"Servidor web escuchando en puerto {port}")
     server.serve_forever()
 
 # ==========================================
-# 3. LÓGICA DEL BOT Y TELEGRAM
+# 3. ENVÍO DE MENSAJES BLINDADO A TELEGRAM
 # ==========================================
 def enviar_telegram(mensaje):
-    """Envía un mensaje a Telegram"""
+    """Envía mensaje a Telegram. Si falla Markdown, lo reintenta en texto plano."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    
+    # Intento 1: Con formato Markdown
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
     try:
-        respuesta = requests.post(url, json=payload, timeout=10)
-        respuesta.raise_for_status()
+        res = requests.post(url, json=payload, timeout=10)
+        if not res.ok:
+            # Intento 2: Si Telegram rechaza el formato Markdown, enviar en texto plano
+            payload_simple = {"chat_id": CHAT_ID, "text": mensaje}
+            requests.post(url, json=payload_simple, timeout=10)
     except Exception as e:
         print(f"Error enviando mensaje a Telegram: {e}")
 
 def obtener_analisis_fundamental(titulo):
-    """Evalúa el evento y retorna el análisis técnico-fundamental en español"""
-    titulo_lower = titulo.lower()
+    """Evalúa el evento y retorna el análisis en español"""
+    titulo_lower = str(titulo).lower()
     
     if "speaks" in titulo_lower or "powell" in titulo_lower or "testifies" in titulo_lower or "president" in titulo_lower:
         return (
@@ -89,9 +94,9 @@ def obtener_analisis_fundamental(titulo):
 
 def enviar_alerta_15_min(evento):
     """Envía la alerta preventiva 15 minutos antes de la noticia"""
-    titulo = evento.get("event")
+    titulo = evento.get("event", evento.get("title", "Evento sin título"))
     divisa = evento.get("currency", evento.get("country", "Global"))
-    hora = evento.get("hora_formateada")
+    hora = evento.get("hora_formateada", "N/A")
     
     analisis = obtener_analisis_fundamental(titulo)
     
@@ -105,29 +110,66 @@ def enviar_alerta_15_min(evento):
     enviar_telegram(mensaje)
 
 def procesar_rutina_diaria():
-    """Consulta la API de FMP a las 6:00 AM y programa las alarmas"""
-    print("Revisando el calendario económico institucional...")
+    """Consulta el calendario económico y programa las alertas del día"""
+    print("Revisando el calendario económico...")
     
     ahora_col = datetime.now(COLOMBIA_TZ)
     fecha_hoy = ahora_col.strftime("%Y-%m-%d")
     
-    url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={fecha_hoy}&to={fecha_hoy}&apikey={API_KEY_FMP}"
+    # 1. Intentar con FMP API
+    url_fmp = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={fecha_hoy}&to={fecha_hoy}&apikey={API_KEY_FMP}"
     
+    datos = None
     try:
-        respuesta = requests.get(url, timeout=10)
-        respuesta.raise_for_status()
-        datos = respuesta.json()
-        
-        eventos_hoy = []
-        
-        for evento in datos:
-            if evento.get("impact") == "High":
-                fecha_str = evento.get("date")  # Formato FMP: "YYYY-MM-DD HH:MM:SS" (UTC)
-                
-                hora_utc = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S")
-                hora_utc = pytz.utc.localize(hora_utc)
+        res = requests.get(url_fmp, timeout=10)
+        if res.ok:
+            json_res = res.json()
+            if isinstance(json_res, list):
+                datos = json_res
+    except Exception as e:
+        print(f"Error consultando FMP: {e}")
+
+    # 2. Respaldo a FairEconomy si FMP no devolvió una lista válida
+    if datos is None:
+        print("Usando fuente secundaria (FairEconomy)...")
+        url_fe = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        try:
+            res_fe = requests.get(url_fe, headers=headers, timeout=10)
+            if res_fe.ok and isinstance(res_fe.json(), list):
+                datos_fe = res_fe.json()
+                datos = []
+                for ev in datos_fe:
+                    if ev.get("date", "").startswith(fecha_hoy):
+                        datos.append({
+                            "event": ev.get("title"),
+                            "currency": ev.get("country"),
+                            "impact": ev.get("impact"),
+                            "date": ev.get("date")
+                        })
+        except Exception as e:
+            print(f"Error consultando fuente secundaria: {e}")
+
+    if datos is None:
+        enviar_telegram("⚠️ No se pudo conectar con los servidores de calendario económico hoy.")
+        return
+
+    eventos_hoy = []
+    
+    for evento in datos:
+        if evento.get("impact") == "High":
+            fecha_str = str(evento.get("date", ""))
+            
+            try:
+                if "T" in fecha_str:
+                    if fecha_str.endswith("Z"):
+                        fecha_str = fecha_str[:-1] + "+00:00"
+                    hora_utc = datetime.fromisoformat(fecha_str)
+                else:
+                    hora_utc = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S")
+                    hora_utc = pytz.utc.localize(hora_utc)
+
                 hora_colombia = hora_utc.astimezone(COLOMBIA_TZ)
-                
                 evento['hora_formateada'] = hora_colombia.strftime("%I:%M %p")
                 eventos_hoy.append(evento)
                 
@@ -141,32 +183,29 @@ def procesar_rutina_diaria():
                         run_date=hora_alerta,
                         args=[evento]
                     )
-        
-        # Enviar reporte diario matutino
-        if len(eventos_hoy) > 0:
-            msg_matutino = f"🚨 *REPORTE INSTITUCIONAL DE NOTICIAS* 🚨\n📅 *Fecha:* {fecha_hoy}\n\n⚠️ *Alto Impacto Hoy:*\n\n"
-            for ev in eventos_hoy:
-                div = ev.get('currency', ev.get('country', 'Global'))
-                msg_matutino += f"🔴 *{div}* - {ev['event']}\n⏰ *Hora:* {ev['hora_formateada']} COT\n\n"
-            msg_matutino += "💡 _Las alertas con análisis fundamental llegarán 15 minutos antes de cada evento._"
-            enviar_telegram(msg_matutino)
-        else:
-            enviar_telegram("✅ *REPORTE MATUTINO*\n\nHoy no hay noticias de Alto Impacto (Carpeta Roja) programadas. Mercado limpio.")
-            
-    except Exception as e:
-        print(f"Error consultando calendario: {e}")
-        enviar_telegram(f"⚠️ Error al conectar con la API de noticias: {e}")
+            except Exception as err_parse:
+                print(f"Error parseando fecha '{fecha_str}': {err_parse}")
+
+    # Enviar reporte diario matutino
+    if len(eventos_hoy) > 0:
+        msg_matutino = f"🚨 *REPORTE INSTITUCIONAL DE NOTICIAS* 🚨\n📅 *Fecha:* {fecha_hoy}\n\n⚠️ *Alto Impacto Hoy:*\n\n"
+        for ev in eventos_hoy:
+            div = ev.get('currency', ev.get('country', 'Global'))
+            msg_matutino += f"🔴 *{div}* - {ev.get('event', ev.get('title'))}\n⏰ *Hora:* {ev['hora_formateada']} COT\n\n"
+        msg_matutino += "💡 _Las alertas con análisis fundamental llegarán 15 minutos antes de cada evento._"
+        enviar_telegram(msg_matutino)
+    else:
+        enviar_telegram("✅ *REPORTE MATUTINO*\n\nHoy no hay noticias de Alto Impacto (Carpeta Roja) programadas. Mercado limpio.")
 
 def iniciar_bot():
-    # 1. Iniciar servidor web interno en segundo plano para Render Gratis
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
     
     enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia) en servidor gratuito.")
     
-    # 2. Ejecución inmediata
+    # Ejecución inmediata al arrancar
     procesar_rutina_diaria()
     
-    # 3. Programación diaria a las 6:00 AM COT
+    # Programación diaria a las 6:00 AM COT
     scheduler.add_job(procesar_rutina_diaria, 'cron', hour=6, minute=0)
     
     print("Bot corriendo 24/7...")
@@ -174,31 +213,3 @@ def iniciar_bot():
 
 if __name__ == "__main__":
     iniciar_bot()
-def iniciar_bot():
-    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
-    
-    enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia) en servidor gratuito.")
-    
-    # ==========================================
-    # 🧪 PRUEBA TEMPORAL DE ALERTA EN 1 MINUTO
-    # ==========================================
-    hora_prueba = datetime.now(COLOMBIA_TZ) + timedelta(minutes=1)
-    evento_prueba = {
-        "event": "CPI m/m (PRUEBA)",
-        "currency": "USD",
-        "hora_formateada": hora_prueba.strftime("%I:%M %p")
-    }
-    scheduler.add_job(
-        enviar_alerta_15_min,
-        'date',
-        run_date=hora_prueba,
-        args=[evento_prueba]
-    )
-    print(f"Alerta de prueba programada para las: {hora_prueba.strftime('%I:%M:%S %p')}")
-    # ==========================================
-
-    procesar_rutina_diaria()
-    scheduler.add_job(procesar_rutina_diaria, 'cron', hour=6, minute=0)
-    
-    print("Bot corriendo 24/7...")
-    scheduler.start()
