@@ -1,8 +1,10 @@
 import os
 import requests
+import threading
 from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==========================================
 # 1. CREDENCIALES Y CONFIGURACIÓN
@@ -14,6 +16,27 @@ API_KEY_FMP = os.getenv("FMP_API_KEY", "LVP44JAPKM0cxlSSnWu1BSRCE4ykLQA0")
 COLOMBIA_TZ = pytz.timezone("America/Bogota")
 scheduler = BlockingScheduler(timezone=COLOMBIA_TZ)
 
+# ==========================================
+# 2. SERVIDOR WEB INTERNO (PARA PLAN GRATUITO EN RENDER)
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot de Noticias activo 24/7 en Render Free Tier")
+
+    def log_message(self, format, *args):
+        return  # Desactiva logs molestos de HTTP en la consola
+
+def iniciar_servidor_web():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Servidor web escuchando en el puerto {port} (Render Free Tier Activo)")
+    server.serve_forever()
+
+# ==========================================
+# 3. LÓGICA DEL BOT Y TELEGRAM
+# ==========================================
 def enviar_telegram(mensaje):
     """Envía un mensaje a Telegram"""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -101,7 +124,6 @@ def procesar_rutina_diaria():
             if evento.get("impact") == "High":
                 fecha_str = evento.get("date")  # Formato FMP: "YYYY-MM-DD HH:MM:SS" (UTC)
                 
-                # Convertir hora UTC a zona horaria de Colombia (UTC-5)
                 hora_utc = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S")
                 hora_utc = pytz.utc.localize(hora_utc)
                 hora_colombia = hora_utc.astimezone(COLOMBIA_TZ)
@@ -136,12 +158,15 @@ def procesar_rutina_diaria():
         enviar_telegram(f"⚠️ Error al conectar con la API de noticias: {e}")
 
 def iniciar_bot():
-    enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia) usando API Institucional.")
+    # 1. Iniciar servidor web interno en segundo plano para Render Gratis
+    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
     
-    # Ejecución inmediata al arrancar
+    enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia) en servidor gratuito.")
+    
+    # 2. Ejecución inmediata
     procesar_rutina_diaria()
     
-    # Programación diaria automática a las 6:00 AM COT
+    # 3. Programación diaria a las 6:00 AM COT
     scheduler.add_job(procesar_rutina_diaria, 'cron', hour=6, minute=0)
     
     print("Bot corriendo 24/7...")
