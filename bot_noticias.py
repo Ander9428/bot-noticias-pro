@@ -6,9 +6,11 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 # ==========================================
 # 1. CREDENCIALES DE TELEGRAM
+# Reemplaza 'TU_TOKEN_AQUI' y 'TU_CHAT_ID_AQUI' con tus datos reales
+# o usa variables de entorno para mayor seguridad.
 # ==========================================
-TOKEN = "8007552290:AAHH8KQrYklwR6oh8Tjw2_VbUvXs1D8Zd_I"
-CHAT_ID = "848594835"
+TOKEN = os.getenv("TELEGRAM_TOKEN", "8007552290:AAHH8KQrYklwR6oh8Tjw2_VbUvXs1D8Zd_I")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "848594835")
 
 COLOMBIA_TZ = pytz.timezone("America/Bogota")
 scheduler = BlockingScheduler(timezone=COLOMBIA_TZ)
@@ -18,9 +20,10 @@ def enviar_telegram(mensaje):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload)
+        respuesta = requests.post(url, json=payload, timeout=10)
+        respuesta.raise_for_status()
     except Exception as e:
-        print(f"Error enviando mensaje: {e}")
+        print(f"Error enviando mensaje a Telegram: {e}")
 
 def obtener_analisis_fundamental(titulo):
     """Evalúa el evento y retorna el análisis en español"""
@@ -84,8 +87,13 @@ def procesar_rutina_diaria():
     print("Revisando el calendario económico de hoy...")
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    
     try:
-        respuesta = requests.get(url)
+        respuesta = requests.get(url, headers=headers, timeout=10)
+        respuesta.raise_for_status()
         datos = respuesta.json()
         
         ahora_col = datetime.now(COLOMBIA_TZ)
@@ -94,8 +102,13 @@ def procesar_rutina_diaria():
         eventos_hoy = []
         
         for evento in datos:
-            if evento.get("impact") == "High" and evento.get("date").startswith(fecha_hoy):
-                hora_utc = datetime.fromisoformat(evento.get("date"))
+            fecha_evento = evento.get("date", "")
+            if evento.get("impact") == "High" and fecha_evento.startswith(fecha_hoy):
+                # Formatear la cadena ISO para asegurar compatibilidad con la zona horaria UTC
+                if fecha_evento.endswith("Z"):
+                    fecha_evento = fecha_evento[:-1] + "+00:00"
+                
+                hora_utc = datetime.fromisoformat(fecha_evento)
                 hora_colombia = hora_utc.astimezone(COLOMBIA_TZ)
                 
                 evento['hora_formateada'] = hora_colombia.strftime("%I:%M %p")
@@ -104,7 +117,7 @@ def procesar_rutina_diaria():
                 # Programar la alarma 15 minutos antes
                 hora_alerta = hora_colombia - timedelta(minutes=15)
                 
-                # Solo programa si la hora de la noticia aún no ha pasado hoy
+                # Solo programa si la hora de la alerta aún no ha pasado
                 if hora_alerta > ahora_col:
                     scheduler.add_job(
                         enviar_alerta_15_min, 
@@ -125,7 +138,7 @@ def procesar_rutina_diaria():
             
     except Exception as e:
         print(f"Error consultando calendario: {e}")
-        enviar_telegram("⚠️ Error al conectar con el calendario económico.")
+        enviar_telegram(f"⚠️ Error al conectar con el calendario económico: {e}")
 
 def iniciar_bot():
     enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia). El bot está activo y monitoreando el mercado.")
