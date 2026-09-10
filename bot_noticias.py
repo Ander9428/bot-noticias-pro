@@ -1,215 +1,122 @@
-import os
-import requests
+import telebot
+from flask import Flask
 import threading
-from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime, timedelta
+import time
 
 # ==========================================
-# 1. CREDENCIALES Y CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # ==========================================
-TOKEN = os.getenv("TELEGRAM_TOKEN", "8007552290:AAHH8KQrYklwR6oh8Tjw2_VbUvXs1D8Zd_I")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "848594835")
-API_KEY_FMP = os.getenv("FMP_API_KEY", "LVP44JAPKM0cxlSSnWu1BSRCE4ykLQA0")
+TOKEN = 'TU_TOKEN_DE_TELEGRAM'
+CHAT_ID = 'TU_CHAT_ID'  # Tu ID de usuario para recibir los mensajes
+ZONA_HORARIA = pytz.timezone('America/Bogota')
 
-COLOMBIA_TZ = pytz.timezone("America/Bogota")
-scheduler = BlockingScheduler(timezone=COLOMBIA_TZ)
+# Filtro de las divisas que operas en tus análisis técnicos
+DIVISAS_OBJETIVO = ["EUR", "USD", "JPY", "GBP", "AUD", "CAD", "CHF"]
 
-# ==========================================
-# 2. SERVIDOR WEB INTERNO (PARA PLAN GRATUITO EN RENDER)
-# ==========================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot de Noticias activo 24/7 en Render Free Tier")
-
-    def log_message(self, format, *args):
-        return  # Desactiva logs molestos en consola
-
-def iniciar_servidor_web():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"Servidor web escuchando en puerto {port}")
-    server.serve_forever()
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
 # ==========================================
-# 3. ENVÍO DE MENSAJES BLINDADO A TELEGRAM
+# 1. SISTEMA ANTI-SUSPENSIÓN (FLASK)
 # ==========================================
-def enviar_telegram(mensaje):
-    """Envía mensaje a Telegram. Si falla Markdown, lo reintenta en texto plano."""
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+@app.route('/')
+def keep_alive():
+    return "Servidor del Bot Activo y Sincronizado (UTC-5)."
+
+def run_flask():
+    # El puerto 10000 es el estándar que Render asigna a los Web Services
+    app.run(host='0.0.0.0', port=10000)
+
+# ==========================================
+# 2. ANÁLISIS FUNDAMENTAL (FÁCIL DE ENTENDER)
+# ==========================================
+def generar_explicacion_fundamental(evento, divisa):
+    """
+    Entrega una explicación clara, sin jerga innecesaria, de lo que 
+    significa la noticia y cómo afecta la liquidez en tus gráficos.
+    """
+    evento_lower = evento.lower()
+    explicacion = ""
     
-    # Intento 1: Con formato Markdown
-    payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
-    try:
-        res = requests.post(url, json=payload, timeout=10)
-        if not res.ok:
-            # Intento 2: Si Telegram rechaza el formato Markdown, enviar en texto plano
-            payload_simple = {"chat_id": CHAT_ID, "text": mensaje}
-            requests.post(url, json=payload_simple, timeout=10)
-    except Exception as e:
-        print(f"Error enviando mensaje a Telegram: {e}")
-
-def obtener_analisis_fundamental(titulo):
-    """Evalúa el evento y retorna el análisis en español"""
-    titulo_lower = str(titulo).lower()
-    
-    if "speaks" in titulo_lower or "powell" in titulo_lower or "testifies" in titulo_lower or "president" in titulo_lower:
-        return (
-            "🗣️ *ANÁLISIS FUNDAMENTAL (COMPARECENCIA):*\n"
-            "Los discursos oficiales generan picos de volatilidad impredecibles. Los algoritmos institucionales leen el texto en vivo buscando pistas.\n"
-            "• *Tono Hawkish (Agresivo):* Apoyo a tasas altas o alerta de inflación = *Divisa sube fuerte*.\n"
-            "• *Tono Dovish (Suave):* Preocupación por economía o recortes = *Divisa cae*.\n"
-            "⚠️ _Precaución: El precio suele hacer movimientos falsos antes de tomar dirección._"
-        )
-    elif "cpi" in titulo_lower or "inflation" in titulo_lower or "pce" in titulo_lower:
-        return (
-            "📊 *ANÁLISIS FUNDAMENTAL (INFLACIÓN):*\n"
-            "Mide el costo de vida. Es el dato más importante para los bancos centrales.\n"
-            "• *Dato mayor al esperado:* Presiona al banco a subir tasas = *Divisa sube*.\n"
-            "• *Dato menor al esperado:* Alivia la presión, acerca recortes = *Divisa cae*."
-        )
-    elif "rate" in titulo_lower or "fund" in titulo_lower:
-        return (
-            "🏦 *ANÁLISIS FUNDAMENTAL (TASAS DE INTERÉS):*\n"
-            "Define qué tan 'atractiva' es la divisa para los inversores extranjeros.\n"
-            "• *Subida de tasa:* Atrae capital = *Divisa sube*.\n"
-            "• *Corte de tasa:* Aleja capital buscando mejor rendimiento = *Divisa cae*."
-        )
-    elif "nfp" in titulo_lower or "employment" in titulo_lower or "payrolls" in titulo_lower or "unemployment" in titulo_lower:
-        return (
-            "💼 *ANÁLISIS FUNDAMENTAL (EMPLEO):*\n"
-            "Mide la salud económica. Si hay mucho empleo, hay gasto e inflación.\n"
-            "• *Más empleo del esperado:* Economía fuerte = *Divisa sube*.\n"
-            "• *Menos empleo (o más desempleo):* Economía débil = *Divisa cae*."
-        )
+    if "pib" in evento_lower or "gdp" in evento_lower:
+        explicacion = "Mide la salud económica general. Si sale mayor a lo esperado, fortalece la divisa; si sale menor, la debilita. Espera alta volatilidad."
+    elif "ipc" in evento_lower or "cpi" in evento_lower or "inflación" in evento_lower:
+        explicacion = "Mide el costo de vida. Una inflación alta obliga a los bancos a subir tasas, fortaleciendo la divisa temporalmente pero dañando la economía a largo plazo."
+    elif "tasas" in evento_lower or "interest rate" in evento_lower:
+        explicacion = "La noticia más fuerte. Si suben las tasas, entra capital extranjero y la divisa se dispara. Si las bajan, el dinero sale a buscar mejores rendimientos."
+    elif "nóminas" in evento_lower or "nfp" in evento_lower or "desempleo" in evento_lower:
+        explicacion = "Mide la creación de empleo. Un desempleo alto debilita la divisa. Suele generar mechazos violentos en temporalidades de 5m y 15m."
     else:
-        return (
-            "📊 *ANÁLISIS FUNDAMENTAL:*\n"
-            "Dato de alto impacto. Una desviación grande entre el dato 'Actual' y 'Esperado' generará un fuerte desequilibrio institucional.\n"
-            "⚠️ _Asegura posiciones y espera a que el mercado absorba la liquidez._"
-        )
+        explicacion = "Noticia de alto impacto (3 toros). Protege tus posiciones (Breakeven) y espera a que el spread se normalice antes de buscar entradas por Smart Money."
+        
+    return f"\n🧠 **Análisis Fundamental:** {explicacion}"
 
-def enviar_alerta_15_min(evento):
-    """Envía la alerta preventiva 15 minutos antes de la noticia"""
-    titulo = evento.get("event", evento.get("title", "Evento sin título"))
-    divisa = evento.get("currency", evento.get("country", "Global"))
-    hora = evento.get("hora_formateada", "N/A")
-    
-    analisis = obtener_analisis_fundamental(titulo)
-    
-    mensaje = (
-        "🚨 *ALERTA PREVENTIVA (FALTAN 15 MINUTOS)* 🚨\n\n"
-        f"🔴 *Divisa:* {divisa}\n"
-        f"🏛 *Evento:* {titulo}\n"
-        f"⏰ *Hora de Impacto:* {hora} COT\n\n"
-        f"{analisis}"
-    )
-    enviar_telegram(mensaje)
+# ==========================================
+# 3. MOTOR DE ALERTAS (MENSAJES)
+# ==========================================
+def enviar_alerta(evento, divisa, impacto, tipo_alerta):
+    if divisa not in DIVISAS_OBJETIVO:
+        return # Ignora divisas como NZD, CNY, etc.
 
-def procesar_rutina_diaria():
-    """Consulta el calendario económico y programa las alertas del día"""
-    print("Revisando el calendario económico...")
+    analisis = generar_explicacion_fundamental(evento, divisa)
     
-    ahora_col = datetime.now(COLOMBIA_TZ)
-    fecha_hoy = ahora_col.strftime("%Y-%m-%d")
-    
-    # 1. Intentar con FMP API
-    url_fmp = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={fecha_hoy}&to={fecha_hoy}&apikey={API_KEY_FMP}"
-    
-    datos = None
-    try:
-        res = requests.get(url_fmp, timeout=10)
-        if res.ok:
-            json_res = res.json()
-            if isinstance(json_res, list):
-                datos = json_res
-    except Exception as e:
-        print(f"Error consultando FMP: {e}")
+    if tipo_alerta == "30_MIN":
+        mensaje = f"⚠️ **ALERTA: Faltan 30 Minutos** ⚠️\n\n📌 **Noticia:** {evento}\n💱 **Divisa:** {divisa} (Impacto: {impacto})\n{analisis}\n\n*Recomendación:* Revisa si el precio se acerca a tus niveles institucionales (00, 25, 50, 75)."
+    elif tipo_alerta == "5_MIN":
+        mensaje = f"🚨 **ALERTA INMINENTE: Faltan 5 Minutos** 🚨\n\n📌 **Noticia:** {evento}\n💱 **Divisa:** {divisa}\n\n*Acción:* Asegura Stop Loss, alta probabilidad de deslizamiento (slippage) y manipulación del spread."
+    elif tipo_alerta == "AHORA":
+        mensaje = f"💥 **NOTICIA PUBLICADA AHORA** 💥\n\n📌 **Noticia:** {evento}\n💱 **Divisa:** {divisa}"
+        
+    bot.send_message(CHAT_ID, mensaje, parse_mode='Markdown')
 
-    # 2. Respaldo a FairEconomy si FMP no devolvió una lista válida
-    if datos is None:
-        print("Usando fuente secundaria (FairEconomy)...")
-        url_fe = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        try:
-            res_fe = requests.get(url_fe, headers=headers, timeout=10)
-            if res_fe.ok and isinstance(res_fe.json(), list):
-                datos_fe = res_fe.json()
-                datos = []
-                for ev in datos_fe:
-                    if ev.get("date", "").startswith(fecha_hoy):
-                        datos.append({
-                            "event": ev.get("title"),
-                            "currency": ev.get("country"),
-                            "impact": ev.get("impact"),
-                            "date": ev.get("date")
-                        })
-        except Exception as e:
-            print(f"Error consultando fuente secundaria: {e}")
-
-    if datos is None:
-        enviar_telegram("⚠️ No se pudo conectar con los servidores de calendario económico hoy.")
-        return
-
-    eventos_hoy = []
+# ==========================================
+# 4. REPORTE MATUTINO (6:00 AM)
+# ==========================================
+def reporte_matutino():
+    """Se ejecuta todos los días a las 6:00 AM hora Colombia."""
+    # AQUÍ DEBES LLAMAR A TU FUNCIÓN DE SCRAPING DE INVESTING/FOREX FACTORY
+    # noticias_hoy = tu_funcion_de_extraccion() 
     
-    for evento in datos:
-        if evento.get("impact") == "High":
-            fecha_str = str(evento.get("date", ""))
-            
-            try:
-                if "T" in fecha_str:
-                    if fecha_str.endswith("Z"):
-                        fecha_str = fecha_str[:-1] + "+00:00"
-                    hora_utc = datetime.fromisoformat(fecha_str)
-                else:
-                    hora_utc = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S")
-                    hora_utc = pytz.utc.localize(hora_utc)
+    # Ejemplo simulado:
+    mensaje = "🌅 **Resumen del Mercado - Alto Impacto (3 Toros)** 🌅\n\n"
+    mensaje += "🗓️ Hoy tenemos las siguientes inyecciones de liquidez:\n"
+    mensaje += "- 08:30 AM | USD | IPC (Inflación)\n"
+    mensaje += "- 02:00 PM | USD | Decisión de Tasas de Interés\n\n"
+    mensaje += "Prepara tus sesiones y marca tus bloques de órdenes."
+    
+    bot.send_message(CHAT_ID, mensaje, parse_mode='Markdown')
 
-                hora_colombia = hora_utc.astimezone(COLOMBIA_TZ)
-                evento['hora_formateada'] = hora_colombia.strftime("%I:%M %p")
-                eventos_hoy.append(evento)
-                
-                # Programar la alarma 15 minutos antes
-                hora_alerta = hora_colombia - timedelta(minutes=15)
-                
-                if hora_alerta > ahora_col:
-                    scheduler.add_job(
-                        enviar_alerta_15_min,
-                        'date',
-                        run_date=hora_alerta,
-                        args=[evento]
-                    )
-            except Exception as err_parse:
-                print(f"Error parseando fecha '{fecha_str}': {err_parse}")
-
-    # Enviar reporte diario matutino
-    if len(eventos_hoy) > 0:
-        msg_matutino = f"🚨 *REPORTE INSTITUCIONAL DE NOTICIAS* 🚨\n📅 *Fecha:* {fecha_hoy}\n\n⚠️ *Alto Impacto Hoy:*\n\n"
-        for ev in eventos_hoy:
-            div = ev.get('currency', ev.get('country', 'Global'))
-            msg_matutino += f"🔴 *{div}* - {ev.get('event', ev.get('title'))}\n⏰ *Hora:* {ev['hora_formateada']} COT\n\n"
-        msg_matutino += "💡 _Las alertas con análisis fundamental llegarán 15 minutos antes de cada evento._"
-        enviar_telegram(msg_matutino)
-    else:
-        enviar_telegram("✅ *REPORTE MATUTINO*\n\nHoy no hay noticias de Alto Impacto (Carpeta Roja) programadas. Mercado limpio.")
-
-def iniciar_bot():
-    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+# ==========================================
+# 5. PROGRAMADOR CRONOLÓGICO (SCHEDULER)
+# ==========================================
+def programar_eventos():
+    scheduler = BackgroundScheduler(timezone=ZONA_HORARIA)
     
-    enviar_telegram("🤖 *Bot de Noticias Pro Iniciado*\nSincronizado con zona horaria UTC-5 (Colombia) en servidor gratuito.")
+    # 1. Programar el reporte de las 6 AM todos los días
+    scheduler.add_job(reporte_matutino, 'cron', hour=6, minute=0)
     
-    # Ejecución inmediata al arrancar
-    procesar_rutina_diaria()
+    # 2. AQUÍ PROGRAMARÍAS LAS ALERTAS BASADO EN TU SCRAPING
+    # Ejemplo de cómo programar una noticia específica de forma dinámica:
+    # fecha_noticia = datetime(2026, 9, 10, 14, 0, 0, tzinfo=ZONA_HORARIA) # 2:00 PM
+    # scheduler.add_job(enviar_alerta, 'date', run_date=fecha_noticia - timedelta(minutes=30), args=['Decisión de Tasas', 'USD', '3 Toros', '30_MIN'])
+    # scheduler.add_job(enviar_alerta, 'date', run_date=fecha_noticia - timedelta(minutes=5), args=['Decisión de Tasas', 'USD', '3 Toros', '5_MIN'])
     
-    # Programación diaria a las 6:00 AM COT
-    scheduler.add_job(procesar_rutina_diaria, 'cron', hour=6, minute=0)
-    
-    print("Bot corriendo 24/7...")
     scheduler.start()
 
+# ==========================================
+# EJECUCIÓN PRINCIPAL
+# ==========================================
 if __name__ == "__main__":
-    iniciar_bot()
+    # Iniciar el programador de tiempo
+    programar_eventos()
+    
+    # Iniciar el servidor web (Flask) en un hilo secundario para evitar bloqueos
+    hilo_web = threading.Thread(target=run_flask)
+    hilo_web.start()
+    
+    print("Iniciando Bot de Telegram y Servidor Web...")
+    # Iniciar la escucha continua del bot de Telegram
+    bot.infinity_polling(timeout=10, long_polling_timeout = 5)
