@@ -1,3 +1,5 @@
-pytz 
-requests 
-APScheduler
+pyTelegramBotAPI
+flask
+apscheduler
+pytz
+requests
