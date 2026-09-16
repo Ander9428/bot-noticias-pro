@@ -824,6 +824,41 @@ def _escapar(texto):
     return (texto or "").replace("_", "-").replace("*", "").replace("`", "'")
 
 
+# Solo presentación visual, ningún dato: la bandera es la del país emisor
+# de cada divisa objetivo (no se inventa nada, es la bandera real de esa
+# moneda) y el ícono de categoría ayuda a reconocer de un vistazo qué tipo
+# de noticia es sin tener que leer el título completo.
+_BANDERAS = {
+    "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵",
+    "AUD": "🇦🇺", "CAD": "🇨🇦", "CHF": "🇨🇭", "NZD": "🇳🇿",
+}
+
+_EMOJI_CATEGORIA = {
+    "Decisión de tasas de interés": "💰",
+    "Producto Interno Bruto (PIB)": "📊",
+    "Inflación (IPC / PCE / PPI)": "🔥",
+    "Tasa de desempleo": "📉",
+    "Solicitudes de subsidio por desempleo": "📝",
+    "Creación de empleo (Nóminas no agrícolas / NFP)": "👷",
+    "PMI / ISM (actividad manufacturera o de servicios)": "🏭",
+    "Ventas minoristas": "🛒",
+    "Balanza comercial": "🚢",
+    "Confianza / sentimiento del consumidor": "😊",
+    "Sector vivienda": "🏠",
+    "Discurso o comparecencia de un banquero central": "🎤",
+    "Actas de la última reunión del banco central": "📜",
+}
+
+
+def _bandera(divisa):
+    return _BANDERAS.get(divisa, "")
+
+
+def _emoji_categoria(titulo):
+    nombre = clasificar_evento(titulo).get("nombre", "")
+    return _EMOJI_CATEGORIA.get(nombre, "📰")
+
+
 def mensaje_previo(grupo, minutos):
     """
     Recibe una LISTA de eventos, no uno solo. Motivo: en días como el de
@@ -850,6 +885,7 @@ def mensaje_previo(grupo, minutos):
     calendario -pediste que eso se corrigiera.
     """
     divisa = grupo[0]["divisa"]
+    bandera = _bandera(divisa)
     hora_local = grupo[0]["fecha"].astimezone(ZONA_HORARIA).strftime("%H:%M")
     es_urgente = minutos <= min(AVISOS_PREVIOS_MIN)
     palabra_min = "minuto" if minutos == 1 else "minutos"
@@ -858,8 +894,9 @@ def mensaje_previo(grupo, minutos):
     if len(grupo) == 1:
         evento = grupo[0]
         titulo = _escapar(traducir_titulo(evento["titulo"]))
+        icono = _emoji_categoria(evento["titulo"])
         base = (
-            f"{emoji} *En {minutos} {palabra_min}:* {titulo} ({divisa})\n"
+            f"{emoji} *En {minutos} {palabra_min}:* {icono} {titulo} ({bandera} {divisa})\n"
             f"Impacto: {traducir_impacto(evento['impacto'])} · {hora_local} (Colombia)"
         )
         # Un discurso o unas actas nunca traen pronóstico ni dato anterior
@@ -872,30 +909,44 @@ def mensaje_previo(grupo, minutos):
                 f"Anterior: {evento['anterior'] or 'sin dato'}"
             )
     else:
+        icono = _emoji_categoria(grupo[0]["titulo"])
         titulos = "\n".join(
             f"• {_escapar(traducir_titulo(e['titulo']))}" for e in grupo
         )
         base = (
-            f"{emoji} *En {minutos} {palabra_min}:* {len(grupo)} noticias de "
-            f"{divisa} al mismo tiempo ({hora_local} Colombia):\n{titulos}"
+            f"{emoji} *En {minutos} {palabra_min}:* {icono} {len(grupo)} noticias de "
+            f"{bandera} {divisa} al mismo tiempo ({hora_local} Colombia):\n{titulos}"
         )
 
     if es_urgente:
         return base
 
-    categoria = None
+    # Categorías DISTINTAS del grupo que sí admiten comparación numérica.
+    # No basta con tomar "la primera que aparezca": el reporte de empleo
+    # de EEUU publica Nóminas (NFP, normal: más alto es alcista) y Tasa de
+    # Desempleo (inversa: más alto es bajista) EN EL MISMO instante todos
+    # los meses. Si se tomara la lógica de una sola para las dos, la mitad
+    # de las veces la lectura sería la contraria a la real -se comprobó
+    # armando ese caso exacto: con NFP primero en la lista, el análisis
+    # decía "alcista" sin aclarar que la Tasa de Desempleo funciona al
+    # revés. Por eso, si el grupo mezcla más de una categoría distinta, se
+    # da una línea de razonamiento por cada una en vez de una conclusión
+    # única que solo sería cierta para la mitad del grupo.
+    categorias_comparables = []
+    nombres_vistos = set()
     for ev in grupo:
         cat = clasificar_evento(ev["titulo"])
-        if cat.get("alcista_si_sube") is not None:
-            categoria = cat
-            break
+        if cat.get("alcista_si_sube") is not None and cat["nombre"] not in nombres_vistos:
+            nombres_vistos.add(cat["nombre"])
+            categorias_comparables.append(cat)
 
-    if categoria is None:
+    if not categorias_comparables:
         analisis = (
             "🧠 No trae una cifra que comparar contra un pronóstico: el "
             "mercado reacciona al TONO del mensaje, no a un número."
         )
-    else:
+    elif len(categorias_comparables) == 1:
+        categoria = categorias_comparables[0]
         if categoria["alcista_si_sube"]:
             dir_encima, dir_debajo = "alcista", "bajista"
             razon_encima, razon_debajo = categoria["razon_alcista"], categoria["razon_bajista"]
@@ -907,6 +958,14 @@ def mensaje_previo(grupo, minutos):
             f"— {razon_encima}.\n"
             f"*Por debajo:* {dir_debajo} — {razon_debajo}."
         )
+    else:
+        lineas = ["🧠 *Este grupo mezcla indicadores con lógica distinta:*"]
+        for cat in categorias_comparables:
+            if cat["alcista_si_sube"]:
+                lineas.append(f"• {cat['nombre']}: por encima del pronóstico es alcista, por debajo bajista.")
+            else:
+                lineas.append(f"• {cat['nombre']}: por encima del pronóstico es bajista, por debajo alcista (indicador inverso).")
+        analisis = "\n".join(lineas)
 
     return f"{base}\n\n{analisis}"
 
@@ -915,21 +974,24 @@ def mensaje_publicacion(grupo):
     """Igual que mensaje_previo: recibe una lista para poder agrupar
     noticias simultáneas de la misma divisa en un solo aviso."""
     divisa = grupo[0]["divisa"]
+    bandera = _bandera(divisa)
     if len(grupo) == 1:
         evento = grupo[0]
         titulo = _escapar(traducir_titulo(evento["titulo"]))
+        icono = _emoji_categoria(evento["titulo"])
         # Un discurso "empieza", no "se publica" (no trae una cifra que
         # publicar), así que ni el verbo ni la línea de pronóstico/anterior
         # aplican - ver el mismo razonamiento en mensaje_previo.
         if clasificar_evento(evento["titulo"]).get("alcista_si_sube") is None:
-            return f"🎤 *Empezando ahora:* {titulo} ({divisa})"
+            return f"🎤 *Empezando ahora:* {titulo} ({bandera} {divisa})"
         return (
-            f"💥 *Publicado ahora:* {titulo} ({divisa})\n"
+            f"💥 *Publicado ahora:* {icono} {titulo} ({bandera} {divisa})\n"
             f"Pronóstico: {evento['pronostico'] or 'sin dato'} | "
             f"Anterior: {evento['anterior'] or 'sin dato'}"
         )
+    icono = _emoji_categoria(grupo[0]["titulo"])
     titulos = "\n".join(f"• {_escapar(traducir_titulo(e['titulo']))}" for e in grupo)
-    return f"💥 *Publicado ahora ({divisa}):* {len(grupo)} noticias a la vez\n{titulos}"
+    return f"💥 *Publicado ahora ({bandera} {divisa}):* {icono} {len(grupo)} noticias a la vez\n{titulos}"
 
 
 def mensaje_reaccion(evento, analisis):
@@ -941,12 +1003,14 @@ def mensaje_reaccion(evento, analisis):
     eso: si no hay resultado, silencio, no una nota diciendo que no llegó.
     """
     titulo = _escapar(traducir_titulo(evento["titulo"]))
+    bandera = _bandera(evento["divisa"])
+    icono = _emoji_categoria(evento["titulo"])
     emoji = {"alcista": "🟢", "bajista": "🔴", "neutral": "⚪"}[analisis["direccion"]]
-    linea_lectura = f"Lectura: {analisis['direccion'].upper()} para {evento['divisa']}"
+    linea_lectura = f"Lectura: {analisis['direccion'].upper()} para {bandera} {evento['divisa']}"
     if analisis.get("confirmacion"):
         linea_lectura += f" ({analisis['confirmacion']})"
     return (
-        f"{emoji} *{titulo}* ({evento['divisa']}): {evento['actual']} vs "
+        f"{emoji} *{icono} {titulo}* ({bandera} {evento['divisa']}): {evento['actual']} vs "
         f"{evento['pronostico']} esperado · anterior {evento['anterior']}\n"
         f"{linea_lectura}"
     )
@@ -967,8 +1031,10 @@ def mensaje_reporte_matutino(eventos_hoy):
     for ev in eventos_hoy:
         hora = ev["fecha"].astimezone(ZONA_HORARIA).strftime("%H:%M")
         titulo = _escapar(traducir_titulo(ev["titulo"]))
+        bandera = _bandera(ev["divisa"])
+        icono = _emoji_categoria(ev["titulo"])
         pron = f" (pronóstico: {ev['pronostico']})" if ev["pronostico"] else ""
-        lineas.append(f"• {hora} | {ev['divisa']} | {titulo}{pron}")
+        lineas.append(f"• {hora} | {bandera} {ev['divisa']} | {icono} {titulo}{pron}")
     return "\n".join(lineas)
 
 
