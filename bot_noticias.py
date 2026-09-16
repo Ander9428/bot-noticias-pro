@@ -87,8 +87,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot_forex")
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# Si defines TELEGRAM_TOKEN / TELEGRAM_CHAT_ID como variables de entorno
+# (por ejemplo en Render → Environment), esas tienen prioridad y estos
+# valores de aquí nunca se usan. Quedan como respaldo para que el bot
+# arranque igual si lo corres local sin configurar nada.
+#
+# OJO SI SUBES ESTO A GITHUB: si el repositorio es público (o se vuelve
+# público más adelante, o alguien lo clona), cualquiera que lea este
+# archivo puede controlar tu bot con este token. Si vas a subirlo, lo más
+# seguro sigue siendo borrar los valores de abajo y configurarlos como
+# variables de entorno en Render en su lugar.
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "8007552290:AAHH8KQrYklwR6oh8Tjw2_VbUvXs1D8Zd_I").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "848594835").strip()
 
 if not TOKEN or not CHAT_ID:
     raise SystemExit(
