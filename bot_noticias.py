@@ -116,6 +116,23 @@ DIVISAS_OBJETIVO = {"EUR", "USD", "JPY", "GBP", "AUD", "CAD", "CHF", "NZD"}
 # ForexFactory. Pon también "Medium" si quieres más cobertura.
 IMPACTOS_A_MONITOREAR = {"High"}
 
+# EL FILTRO DE VERDAD: que la fuente marque algo "High" no significa que
+# de verdad mueva el mercado. Investing.com, por ejemplo, desglosa el "dot
+# plot" de la Fed en 5 líneas separadas (una por cada año de proyección) y
+# marca "Flujos de capital a largo plazo" como 3 toros — cosas que ningún
+# trader serio opera. Cada categoría en CATEGORIAS tiene un "nivel":
+#   "clave"      -> tasas, PIB, IPC, empleo, PMI, discursos/actas de
+#                    bancos centrales. Los movedores de mercado reales.
+#   "secundario" -> ventas minoristas, balanza comercial, confianza del
+#                    consumidor, vivienda, solicitudes de desempleo.
+#                    Importan, pero mueven menos.
+#   "descartar"  -> todo lo que no encaja en ninguna categoría reconocida
+#                    (la CATEGORIA_DEFECTO). Por más que el feed lo marque
+#                    "High", si no se reconoce el indicador, no se avisa.
+# Con INCLUIR_SECUNDARIOS en False (por defecto) solo llegan avisos de
+# "clave". Ponlo en True si quieres más cobertura a cambio de más avisos.
+INCLUIR_SECUNDARIOS = False
+
 # Fuente del calendario económico. Es el feed JSON público que usa
 # ForexFactory para su propio calendario (lo consumen decenas de bots y
 # paneles de trading, no es un endpoint privado ni requiere autenticación).
@@ -161,15 +178,22 @@ _estado_salud = {
 # ══════════════════════════════════════════════════════════════════════════
 # 2. PERSISTENCIA SIMPLE (evita mandar el mismo aviso dos veces)
 # ══════════════════════════════════════════════════════════════════════════
+_ESTADO_DEFECTO = {"programados": [], "reacciones_enviadas": []}
+
+
 def _cargar_estado_disco():
     if not os.path.exists(ARCHIVO_ESTADO):
-        return {"programados": []}
+        return dict(_ESTADO_DEFECTO)
     try:
         with open(ARCHIVO_ESTADO, "r", encoding="utf-8") as f:
-            return json.load(f)
+            estado = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         log.warning("No se pudo leer %s (%s); se empieza de cero.", ARCHIVO_ESTADO, e)
-        return {"programados": []}
+        return dict(_ESTADO_DEFECTO)
+    # por si el archivo viene de una version anterior sin esta clave
+    estado.setdefault("reacciones_enviadas", [])
+    estado.setdefault("programados", [])
+    return estado
 
 
 def _guardar_estado_disco(estado):
@@ -178,11 +202,6 @@ def _guardar_estado_disco(estado):
             json.dump(estado, f, ensure_ascii=False, indent=2)
     except OSError as e:
         log.warning("No se pudo guardar %s: %s", ARCHIVO_ESTADO, e)
-
-
-def _clave_evento(evento_id):
-    """ID único y estable de un evento: título+divisa+fecha exacta."""
-    return evento_id
 
 
 def _ya_programado(estado, clave):
@@ -194,6 +213,26 @@ def _marcar_programado(estado, clave):
     # Se conservan solo las últimas 500 claves para que el archivo no
     # crezca sin límite; con eso sobra para varias semanas de cobertura.
     estado["programados"] = estado["programados"][-500:]
+    _guardar_estado_disco(estado)
+
+
+def _ya_reaccion_enviada(clave):
+    """
+    A diferencia de `_ya_programado`, esto SÍ se persiste en disco (antes
+    solo vivía en un set en memoria). Si Render reinicia el proceso a
+    mitad de la ventana de 30 minutos de reintentos -pasa seguido en el
+    plan gratis-, sin esto se podía mandar la MISMA comparación real dos
+    veces. Se lee el archivo fresco en cada llamada porque job_reaccion se
+    dispara pocas veces por evento, el costo es insignificante.
+    """
+    estado = _cargar_estado_disco()
+    return clave in estado["reacciones_enviadas"]
+
+
+def _marcar_reaccion_enviada(clave):
+    estado = _cargar_estado_disco()
+    estado["reacciones_enviadas"].append(clave)
+    estado["reacciones_enviadas"] = estado["reacciones_enviadas"][-500:]
     _guardar_estado_disco(estado)
 
 
@@ -272,15 +311,61 @@ def obtener_calendario():
     return eventos
 
 
+def _nivel_de_relevancia(titulo):
+    """'clave', 'secundario' o 'descartar' — ver el comentario de
+    INCLUIR_SECUNDARIOS arriba para qué significa cada uno."""
+    return clasificar_evento(titulo).get("nivel", "descartar")
+
+
+# MEDIDO CONTRA EL FEED REAL: ForexFactory casi nunca marca "High" el
+# discurso de un banquero central salvo que sea la rueda de prensa oficial
+# tras una decisión de tasas. Un discurso normal de Powell, Lagarde o
+# Bailey suele venir como "Medium", y el de un miembro cualquiera del
+# comité (no el presidente) como "Medium" o "Low" — visto en vivo con
+# "ECB President Lagarde Speaks" (Medium), "RBA Gov Bullock Speaks"
+# (Medium) y "FOMC Member Bowman Speaks" (Low) el mismo día.
+#
+# Esto se soluciona distinguiendo PRESIDENTE/GOBERNADOR (el jefe del banco
+# central, cuyas palabras sí mueven el mercado aunque la fuente lo marque
+# "Medium") de un MIEMBRO o ADJUNTO cualquiera (para quien sí se respeta
+# el impacto que diga la fuente, o sencillamente no se avisa).
+_PALABRAS_JEFE_BANCO_CENTRAL = ["chair", "president", "governor", " gov ", "chairman"]
+_PALABRAS_NO_ES_EL_JEFE = ["assist", "deputy", "vice", "member"]
+
+
+def _es_jefe_banco_central(titulo):
+    """True solo para el presidente/gobernador/chair (Powell, Lagarde,
+    Bailey, Bullock...), nunca para un adjunto, vice o miembro cualquiera
+    del comité."""
+    t = f" {(titulo or '').lower()} "
+    if any(p in t for p in _PALABRAS_NO_ES_EL_JEFE):
+        return False
+    return any(p in t for p in _PALABRAS_JEFE_BANCO_CENTRAL)
+
+
 def eventos_relevantes(eventos, solo_hoy=False):
-    """Filtra por divisa objetivo, impacto configurado y, si se pide,
-    que caigan en el día de hoy (hora de Colombia)."""
+    """Filtra por divisa objetivo, impacto de la fuente, y por si el
+    indicador es de los que de verdad mueven el mercado (ver
+    INCLUIR_SECUNDARIOS). Que ForexFactory diga "High" ya no basta por sí
+    solo — y a la inversa: si es el PRESIDENTE de un banco central
+    hablando, se avisa aunque la fuente lo marque "Medium" o "Low", porque
+    sus palabras mueven el mercado más de lo que esa etiqueta sugiere."""
     ahora_bogota = datetime.now(ZONA_HORARIA)
     resultado = []
     for ev in eventos:
         if ev["divisa"] not in DIVISAS_OBJETIVO:
             continue
-        if ev["impacto"] not in IMPACTOS_A_MONITOREAR:
+        nivel = _nivel_de_relevancia(ev["titulo"])
+        if nivel == "descartar":
+            continue
+        if nivel == "secundario" and not INCLUIR_SECUNDARIOS:
+            continue
+        categoria = clasificar_evento(ev["titulo"])
+        es_jefe_hablando = (
+            categoria.get("nombre") == "Discurso o comparecencia de un banquero central"
+            and _es_jefe_banco_central(ev["titulo"])
+        )
+        if ev["impacto"] not in IMPACTOS_A_MONITOREAR and not es_jefe_hablando:
             continue
         if solo_hoy:
             fecha_bogota = ev["fecha"].astimezone(ZONA_HORARIA)
@@ -311,8 +396,17 @@ CATEGORIAS = {
             "tipo de interés", "fomc statement", "boe rate", "ecb rate",
             "rba rate", "boc rate", "snb rate", "rate decision",
             "decisión de tasas", "decisión de tipos",
+            # Estos dos faltaban y por eso "Federal Funds Rate" -el numero
+            # de la tasa en si, lo mas importante del dia de la Fed- se
+            # estaba CLASIFICANDO COMO "descartar" mientras que el
+            # comunicado y la rueda de prensa si pasaban. Se encontro
+            # probando el filtro contra el calendario real, no a ojo.
+            "federal funds rate", "official bank rate", "overnight rate",
+            "cash rate", "economic projections", "summary of economic projections",
+            "dot plot",
         ],
         "nombre": "Decisión de tasas de interés",
+        "nivel": "clave",
         "alcista_si_sube": True,
         "explicacion": (
             "Es la noticia de mayor peso del calendario. Una tasa más alta "
@@ -333,6 +427,7 @@ CATEGORIAS = {
     "pib": {
         "claves": ["pib", "gdp", "producto interno bruto"],
         "nombre": "Producto Interno Bruto (PIB)",
+        "nivel": "clave",
         "alcista_si_sube": True,
         "explicacion": (
             "Mide cuánto creció (o se contrajo) la economía en el periodo. "
@@ -350,6 +445,7 @@ CATEGORIAS = {
             "índice de precios al productor",
         ],
         "nombre": "Inflación (IPC / PCE / PPI)",
+        "nivel": "clave",
         "alcista_si_sube": True,
         "explicacion": (
             "Mide cuánto subió el costo de vida. Una inflación por encima de "
@@ -364,6 +460,7 @@ CATEGORIAS = {
     "desempleo_tasa": {
         "claves": ["tasa de desempleo", "unemployment rate"],
         "nombre": "Tasa de desempleo",
+        "nivel": "clave",
         "alcista_si_sube": False,  # indicador inverso
         "explicacion": (
             "Este es de los indicadores que funcionan AL REVÉS: un número "
@@ -381,6 +478,7 @@ CATEGORIAS = {
             "subsidio por desempleo", "claimant count",
         ],
         "nombre": "Solicitudes de subsidio por desempleo",
+        "nivel": "secundario",
         "alcista_si_sube": False,  # indicador inverso
         "explicacion": (
             "Cuenta cuánta gente nueva pidió el seguro de desempleo esa "
@@ -398,6 +496,7 @@ CATEGORIAS = {
             "employment change",
         ],
         "nombre": "Creación de empleo (Nóminas no agrícolas / NFP)",
+        "nivel": "clave",
         "alcista_si_sube": True,
         "explicacion": (
             "Mide cuántos puestos de trabajo nuevos se crearon. Un mercado "
@@ -414,6 +513,7 @@ CATEGORIAS = {
             "actividad manufacturera", "actividad de servicios",
         ],
         "nombre": "PMI / ISM (actividad manufacturera o de servicios)",
+        "nivel": "clave",
         "alcista_si_sube": True,
         "explicacion": (
             "Encuesta a gerentes de compra sobre si el negocio mejora o "
@@ -427,6 +527,7 @@ CATEGORIAS = {
     "ventas_minoristas": {
         "claves": ["ventas minoristas", "retail sales"],
         "nombre": "Ventas minoristas",
+        "nivel": "secundario",
         "alcista_si_sube": True,
         "explicacion": (
             "Mide el gasto de los consumidores, que en la mayoría de "
@@ -440,6 +541,7 @@ CATEGORIAS = {
     "balanza_comercial": {
         "claves": ["balanza comercial", "trade balance"],
         "nombre": "Balanza comercial",
+        "nivel": "secundario",
         "alcista_si_sube": True,
         "explicacion": (
             "La diferencia entre lo que un país exporta e importa. Un "
@@ -457,6 +559,7 @@ CATEGORIAS = {
             "sentimiento del consumidor", "consumer sentiment",
         ],
         "nombre": "Confianza / sentimiento del consumidor",
+        "nivel": "secundario",
         "alcista_si_sube": True,
         "explicacion": (
             "Encuesta directa a los hogares sobre cómo ven su situación "
@@ -473,6 +576,7 @@ CATEGORIAS = {
             "building permits", "housing starts", "inicios de construcción",
         ],
         "nombre": "Sector vivienda",
+        "nivel": "secundario",
         "alcista_si_sube": True,
         "explicacion": (
             "El sector inmobiliario es de los más sensibles a las tasas de "
@@ -484,10 +588,18 @@ CATEGORIAS = {
     },
     "discurso": {
         "claves": [
-            "discurso", "habla", "speech", "testimonio", "testimony",
-            "conferencia de prensa", "press conference", "comparece",
+            # "speaks" faltaba, y es justo como ForexFactory titula la
+            # inmensa mayoria de estos ("Powell Speaks", "Lagarde Speaks",
+            # "BOE Gov Bailey Speaks", "FOMC Member Waller Speaks"...).
+            # Sin esta palabra, TODOS esos discursos se estaban
+            # descartando en silencio -se encontro probando directo
+            # contra nombres reales del feed, no a ojo.
+            "discurso", "habla", "speech", "speaks", "speak", "remarks",
+            "testimonio", "testimony", "conferencia de prensa",
+            "press conference", "comparece",
         ],
         "nombre": "Discurso o comparecencia de un banquero central",
+        "nivel": "clave",
         "alcista_si_sube": None,  # no aplica comparación numérica
         "explicacion": (
             "No trae una cifra que comparar: el movimiento depende del TONO. "
@@ -503,6 +615,7 @@ CATEGORIAS = {
     "actas": {
         "claves": ["actas", "minutes", "fomc minutes"],
         "nombre": "Actas de la última reunión del banco central",
+        "nivel": "clave",
         "alcista_si_sube": None,
         "explicacion": (
             "Es el detalle de la discusión interna de la última reunión de "
@@ -517,6 +630,7 @@ CATEGORIAS = {
 
 CATEGORIA_DEFECTO = {
     "nombre": "Noticia de alto impacto",
+    "nivel": "descartar",
     "alcista_si_sube": None,
     "explicacion": (
         "No es uno de los indicadores más comunes, pero el calendario la "
@@ -529,11 +643,25 @@ CATEGORIA_DEFECTO = {
 }
 
 
+# Algunas fuentes (Investing.com, no la que usa este bot, pero por si algún
+# día se cambia o se cruza contra otro calendario) desglosan el "dot plot"
+# de la Fed en 5 líneas sueltas: "Interest Rate Projection - Third Year",
+# "- Second Year", etc. Contienen la frase "interest rate" y por eso
+# calificarían como "tasas" (clave) sin este filtro, cuando en realidad son
+# el mismo dato reempaquetado 5 veces — justo el tipo de ruido que se
+# pidió excluir. Se descartan ANTES de la clasificación normal.
+_PATRON_PROYECCION_SUELTA = re.compile(
+    r"(interest rate|rate) projection.*\b(year|qtr|quarter)\b", re.IGNORECASE
+)
+
+
 def clasificar_evento(titulo):
     """Identifica a qué categoría económica pertenece el titular de la
     noticia, comparando por palabras clave. Si no reconoce ninguna,
     devuelve la categoría por defecto (sigue tratándose como noticia
     de alto impacto, solo que sin la explicación específica)."""
+    if _PATRON_PROYECCION_SUELTA.search(titulo or ""):
+        return CATEGORIA_DEFECTO
     titulo_normalizado = titulo.lower()
     for datos in CATEGORIAS.values():
         if any(clave in titulo_normalizado for clave in datos["claves"]):
@@ -723,106 +851,104 @@ def _escapar(texto):
     return (texto or "").replace("_", "-").replace("*", "").replace("`", "'")
 
 
-def mensaje_previo(evento, minutos):
+def mensaje_previo(grupo, minutos):
     """
-    OJO: antes esta función tenía el texto "faltan 30 minutos" escrito a
-    mano. Si cambiabas AVISOS_PREVIOS_MIN, el número de la config cambiaba
-    pero el MENSAJE seguía diciendo "30" por dentro, mintiendo sobre el
-    tiempo real. Ahora el número sale siempre de la variable `minutos`,
-    así que un cambio en AVISOS_PREVIOS_MIN se refleja automáticamente en
-    el texto que llega a Telegram.
-    """
-    categoria = clasificar_evento(evento["titulo"])
-    titulo = _escapar(traducir_titulo(evento["titulo"]))
-    hora_local = evento["fecha"].astimezone(ZONA_HORARIA).strftime("%H:%M")
+    Recibe una LISTA de eventos, no uno solo. Motivo: en días como el de
+    la Fed, ForexFactory publica 3-4 noticias en el MISMO minuto exacto
+    (tasa, proyecciones, comunicado...) y antes esto mandaba un aviso casi
+    idéntico por cada una — 4 mensajes seguidos para lo que en la práctica
+    es un solo momento. Ahora, si comparten divisa y hora exacta, se
+    agrupan en uno solo. El caso normal (1 sola noticia) se ve exactamente
+    igual que antes.
 
-    # El aviso más urgente es el que tiene MENOS minutos de anticipación
-    # (el "último recordatorio"), sea cual sea el valor configurado.
+    Se quitó el consejo de trading ("asegura tu stop") y la definición de
+    manual ("el PIB mide..."). Lo que sí se quedó, y es más útil que
+    antes: qué puede ocasionar el dato para el mercado en los dos sentidos
+    posibles, con la MISMA lógica económica real del análisis post-noticia.
+    Solo se agrega en el aviso NO urgente y solo cuando hay una única
+    noticia — con 3-4 indicadores distintos a la vez la lectura neta es
+    genuinamente difícil de anticipar bien, y forzarla daría una
+    conclusión potencialmente equivocada.
+    """
+    divisa = grupo[0]["divisa"]
+    hora_local = grupo[0]["fecha"].astimezone(ZONA_HORARIA).strftime("%H:%M")
     es_urgente = minutos <= min(AVISOS_PREVIOS_MIN)
     palabra_min = "minuto" if minutos == 1 else "minutos"
+    emoji = "🚨" if es_urgente else "⚠️"
 
-    if not es_urgente:
-        cabecera = f"⚠️ *ALERTA: faltan {minutos} {palabra_min}*"
-        # Antes decía "revisa si el precio se acerca a niveles 00/25/50/75":
-        # se quitó a propósito. Se midió con datos reales (28 activos, 2 años,
-        # y de nuevo en vivo contra OANDA) que esos niveles NO tienen ventaja
-        # estadística sobre una línea puesta al azar. Repetirlo aquí sería
-        # venderte una certeza que no existe.
-        cierre = (
-            "Decide de antemano si vas a operar la noticia o vas a esperar a "
-            "que se calme la volatilidad inicial. No es buen momento para "
-            "abrir posiciones nuevas sin un plan de gestión de riesgo claro."
+    if len(grupo) == 1:
+        evento = grupo[0]
+        titulo = _escapar(traducir_titulo(evento["titulo"]))
+        base = (
+            f"{emoji} *En {minutos} {palabra_min}:* {titulo} ({divisa})\n"
+            f"Impacto: {traducir_impacto(evento['impacto'])} · {hora_local} (Colombia)\n"
+            f"Pronóstico: {evento['pronostico'] or 'sin dato'} | "
+            f"Anterior: {evento['anterior'] or 'sin dato'}"
         )
     else:
-        cabecera = f"🚨 *ALERTA INMINENTE: faltan {minutos} {palabra_min}*"
-        cierre = (
-            "Asegura Stop Loss o cierra posiciones sensibles: en los primeros "
-            "segundos tras la publicación el spread se amplía y hay alta "
-            "probabilidad de slippage."
+        titulos = "\n".join(
+            f"• {_escapar(traducir_titulo(e['titulo']))}" for e in grupo
+        )
+        base = (
+            f"{emoji} *En {minutos} {palabra_min}:* {len(grupo)} noticias de "
+            f"{divisa} al mismo tiempo ({hora_local} Colombia):\n{titulos}"
         )
 
-    return (
-        f"{cabecera}\n\n"
-        f"📌 *Noticia:* {titulo}\n"
-        f"💱 *Divisa:* {evento['divisa']} (impacto {traducir_impacto(evento['impacto'])})\n"
-        f"🕒 *Hora:* {hora_local} (Colombia)\n"
-        f"📊 Pronóstico: {evento['pronostico'] or 'sin dato'} | "
-        f"Anterior: {evento['anterior'] or 'sin dato'}\n\n"
-        f"🧠 *{categoria['nombre']}:* {categoria['explicacion']}\n\n"
-        f"👉 {cierre}"
-    )
+    if es_urgente or len(grupo) > 1:
+        return base
 
-
-def mensaje_publicacion(evento):
-    titulo = _escapar(traducir_titulo(evento["titulo"]))
-    categoria = clasificar_evento(evento["titulo"])
+    categoria = clasificar_evento(grupo[0]["titulo"])
     if categoria.get("alcista_si_sube") is None:
-        seguimiento = (
-            "Esta noticia no trae una cifra que comparar (discurso, actas o "
-            "similar). Guíate por la reacción real del precio."
+        analisis = (
+            "🧠 No trae una cifra que comparar contra un pronóstico: el "
+            "mercado reacciona al TONO del mensaje, no a un número."
         )
     else:
-        seguimiento = (
-            f"Revisando el resultado real cada pocos minutos durante la "
-            f"próxima media hora, para compararlo contra el pronóstico en "
-            f"cuanto el calendario lo publique."
+        if categoria["alcista_si_sube"]:
+            dir_encima, dir_debajo = "alcista", "bajista"
+            razon_encima, razon_debajo = categoria["razon_alcista"], categoria["razon_bajista"]
+        else:
+            dir_encima, dir_debajo = "bajista", "alcista"
+            razon_encima, razon_debajo = categoria["razon_bajista"], categoria["razon_alcista"]
+        analisis = (
+            f"🧠 *Por encima del pronóstico:* {dir_encima} para {divisa} "
+            f"— {razon_encima}.\n"
+            f"*Por debajo:* {dir_debajo} — {razon_debajo}."
         )
-    return (
-        f"💥 *NOTICIA PUBLICADA AHORA*\n\n"
-        f"📌 *Noticia:* {titulo}\n"
-        f"💱 *Divisa:* {evento['divisa']}\n"
-        f"📊 Pronóstico: {evento['pronostico'] or 'sin dato'} | "
-        f"Anterior: {evento['anterior'] or 'sin dato'}\n\n"
-        f"{seguimiento}"
-    )
+
+    return f"{base}\n\n{analisis}"
 
 
-def mensaje_reaccion(evento, analisis, agotado=False):
+def mensaje_publicacion(grupo):
+    """Igual que mensaje_previo: recibe una lista para poder agrupar
+    noticias simultáneas de la misma divisa en un solo aviso."""
+    divisa = grupo[0]["divisa"]
+    if len(grupo) == 1:
+        evento = grupo[0]
+        titulo = _escapar(traducir_titulo(evento["titulo"]))
+        return (
+            f"💥 *Publicado ahora:* {titulo} ({divisa})\n"
+            f"Pronóstico: {evento['pronostico'] or 'sin dato'} | "
+            f"Anterior: {evento['anterior'] or 'sin dato'}"
+        )
+    titulos = "\n".join(f"• {_escapar(traducir_titulo(e['titulo']))}" for e in grupo)
+    return f"💥 *Publicado ahora ({divisa}):* {len(grupo)} noticias a la vez\n{titulos}"
+
+
+def mensaje_reaccion(evento, analisis):
+    """
+    Solo se llama cuando SÍ hay un resultado real que mostrar. Si el
+    calendario nunca publica el dato 'actual' (pasa con este feed gratis),
+    o el evento es un discurso/actas sin cifra que comparar, `job_reaccion`
+    nunca invoca esta función y no se manda nada — pediste exactamente
+    eso: si no hay resultado, silencio, no una nota diciendo que no llegó.
+    """
     titulo = _escapar(traducir_titulo(evento["titulo"]))
-    if analisis is None:
-        if agotado:
-            return (
-                f"📎 *Seguimiento: {titulo}* ({evento['divisa']})\n\n"
-                f"Pasaron 30 minutos y el calendario público que usa este bot "
-                f"todavía no muestra el dato *actual*. Pasa a veces con este "
-                f"feed gratuito. Verifica el resultado directamente en "
-                f"forexfactory.com o en el calendario económico de "
-                f"TradingView, y guíate por la reacción real del precio en "
-                f"el gráfico."
-            )
-        return None  # no es el ultimo intento: se espera en silencio
-
     emoji = {"alcista": "🟢", "bajista": "🔴", "neutral": "⚪"}[analisis["direccion"]]
-    linea_razon = f"\n\n📐 *Por qué:* {analisis['razon']}" if analisis["razon"] else ""
-
     return (
-        f"{emoji} *RESULTADO REAL: {titulo}*\n\n"
-        f"💱 *Divisa:* {evento['divisa']}\n"
-        f"📈 Actual: *{evento['actual']}* | Pronóstico: {evento['pronostico']} "
-        f"| Anterior: {evento['anterior']}\n\n"
-        f"El dato {analisis['resultado_txt']}. "
-        f"Lectura fundamental: *{analisis['direccion'].upper()}* para "
-        f"{evento['divisa']}.{linea_razon}"
+        f"{emoji} *{titulo}* ({evento['divisa']}): {evento['actual']} vs "
+        f"{evento['pronostico']} esperado · anterior {evento['anterior']}\n"
+        f"Lectura: {analisis['direccion'].upper()} para {evento['divisa']}"
     )
 
 
@@ -843,7 +969,6 @@ def mensaje_reporte_matutino(eventos_hoy):
         titulo = _escapar(traducir_titulo(ev["titulo"]))
         pron = f" (pronóstico: {ev['pronostico']})" if ev["pronostico"] else ""
         lineas.append(f"• {hora} | {ev['divisa']} | {titulo}{pron}")
-    lineas.append("\nPrepara tus sesiones y marca tus bloques de órdenes.")
     return "\n".join(lineas)
 
 
@@ -858,40 +983,36 @@ def _enviar(mensaje):
         _estado_salud["ultimo_error"] = f"envío: {e}"
 
 
-def job_aviso_previo(evento, minutos):
-    _enviar(mensaje_previo(evento, minutos))
+def job_aviso_previo(grupo, minutos):
+    _enviar(mensaje_previo(grupo, minutos))
 
 
-def job_publicacion(evento):
-    _enviar(mensaje_publicacion(evento))
-
-
-# Eventos para los que YA se mandó la comparación real, para no repetirla
-# en cada reintento una vez que se consiguió el dato. Vive en memoria: si
-# el proceso se reinicia a mitad de la ventana de 30 minutos, en el peor
-# caso se manda un mensaje de más, nunca de menos.
-_eventos_con_reaccion_enviada = set()
+def job_publicacion(grupo):
+    _enviar(mensaje_publicacion(grupo))
 
 
 def _clave_reaccion(evento):
     return f"{evento['divisa']}|{evento['titulo']}|{evento['fecha'].isoformat()}"
 
 
-def job_reaccion(evento, intento, total_intentos):
+def job_reaccion(evento):
     """
     Se llama varias veces por evento (ver REINTENTOS_REACCION_MIN), no una
     sola. En cada llamada vuelve a descargar el calendario completo (el
     'actual' puede tardar en aparecer) y compara contra el pronóstico.
 
-    - Si ya se mandó la comparación en un intento anterior, no hace nada.
-    - Si consigue el dato, manda el resultado real y no vuelve a intentar.
-    - Si no hay dato y todavía quedan intentos, se espera en silencio.
-    - Si no hay dato y este era el ÚLTIMO intento, avisa honestamente que
-      el dato no llegó en vez de fingir una comparación o quedarse callado
-      para siempre.
+    - Si ya se mandó la comparación en un intento anterior, no hace nada
+      (esto se guarda EN DISCO, no solo en memoria, para que sobreviva a
+      un reinicio de Render a mitad de la ventana de 30 minutos).
+    - Si consigue el dato, manda el resultado real UNA vez y no vuelve a
+      intentar.
+    - Si no hay dato (todavía no se publicó, nunca se publica en este feed
+      gratis, o el evento es un discurso/actas sin cifra que comparar), NO
+      SE MANDA NADA. Pediste exactamente eso: si no hay resultado, silencio,
+      nunca una nota diciendo "no lo conseguí, ve a verificar tú mismo".
     """
     clave = _clave_reaccion(evento)
-    if clave in _eventos_con_reaccion_enviada:
+    if _ya_reaccion_enviada(clave):
         return
 
     eventos_frescos = obtener_calendario()
@@ -903,27 +1024,11 @@ def job_reaccion(evento, intento, total_intentos):
             break
 
     analisis = analizar_resultado(actualizado)
-    es_ultimo_intento = intento >= total_intentos
-    mensaje = mensaje_reaccion(actualizado, analisis, agotado=es_ultimo_intento)
+    if analisis is None:
+        return  # sin dato (o no comparable): silencio, se reintenta despues
 
-    if mensaje is None:
-        return  # todavia no hay dato y quedan mas intentos: se espera
-
-    _eventos_con_reaccion_enviada.add(clave)
-    _enviar(mensaje)
-
-
-def job_seguimiento_no_comparable(evento):
-    """Para discursos, actas y similares: no hay cifra que comparar por
-    diseño (no es que 'no haya llegado el dato'), así que se manda UNA
-    nota aclaratoria y no se reintenta."""
-    titulo = _escapar(traducir_titulo(evento["titulo"]))
-    _enviar(
-        f"📎 *Seguimiento: {titulo}* ({evento['divisa']})\n\n"
-        f"Este tipo de noticia no trae una cifra que comparar contra un "
-        f"pronóstico. Lo que mueve el mercado es el TONO del mensaje: revisa "
-        f"el titular en vivo y la reacción real del precio en el gráfico."
-    )
+    _marcar_reaccion_enviada(clave)
+    _enviar(mensaje_reaccion(actualizado, analisis))
 
 
 def job_reporte_matutino():
@@ -945,9 +1050,18 @@ def sincronizar_calendario():
     Descarga el calendario, filtra tus divisas y el impacto que
     monitoreas, y programa (si no estaban programados ya) los avisos de
     cada noticia futura: 15 min antes, 5 min antes, al momento, y la
-    comparación real del resultado (con reintentos hasta por 30 minutos
-    después, o una nota única si es un discurso/actas sin cifra que
-    comparar).
+    comparación real del resultado (con reintentos hasta 30 minutos
+    después; si nunca hay dato que comparar, no se manda nada — ver
+    job_reaccion).
+
+    Los avisos previos y el de publicación se programan por GRUPO, no por
+    evento individual: si dos o más noticias de la misma divisa caen en el
+    minuto exacto (típico en día de la Fed: tasa + proyecciones +
+    comunicado a las 13:00 en punto), se manda un solo aviso combinado en
+    vez de uno por cada una. La comparación real del resultado (reacción)
+    sí se maneja por evento individual, porque cada indicador tiene su
+    propio número que comparar y agruparlos ahí perdería información en
+    vez de solo reducir ruido.
     """
     ahora = datetime.now(pytz.utc)
     estado = _cargar_estado_disco()
@@ -955,59 +1069,60 @@ def sincronizar_calendario():
     relevantes = eventos_relevantes(eventos, solo_hoy=False)
     ventana_reaccion = max(REINTENTOS_REACCION_MIN)
 
-    nuevos = 0
+    grupos = {}
     for ev in relevantes:
-        clave_base = f"{ev['divisa']}|{ev['titulo']}|{ev['fecha'].isoformat()}"
-        if _ya_programado(estado, clave_base):
-            continue
-        if ev["fecha"] < ahora - timedelta(minutes=ventana_reaccion):
-            # Ya pasó de largo (por ejemplo el bot estuvo caído); no tiene
-            # sentido mandar un aviso de "faltan 15 minutos" para algo que
-            # ya ocurrió hace horas.
-            _marcar_programado(estado, clave_base)
-            continue
+        grupos.setdefault((ev["divisa"], ev["fecha"]), []).append(ev)
 
-        for minutos in AVISOS_PREVIOS_MIN:
-            momento = ev["fecha"] - timedelta(minutes=minutos)
-            if momento > ahora:
-                scheduler.add_job(
-                    job_aviso_previo, "date", run_date=momento,
-                    args=[ev, minutos],
-                    id=f"{clave_base}|previo{minutos}", replace_existing=True,
-                )
+    nuevos = 0
+    for (divisa, fecha), grupo in grupos.items():
+        clave_grupo = f"{divisa}|{fecha.isoformat()}|grupo"
+        ya_paso = fecha < ahora - timedelta(minutes=ventana_reaccion)
 
-        if ev["fecha"] > ahora:
-            scheduler.add_job(
-                job_publicacion, "date", run_date=ev["fecha"],
-                args=[ev], id=f"{clave_base}|ahora", replace_existing=True,
-            )
+        if not _ya_programado(estado, clave_grupo):
+            if not ya_paso:
+                for minutos in AVISOS_PREVIOS_MIN:
+                    momento = fecha - timedelta(minutes=minutos)
+                    if momento > ahora:
+                        scheduler.add_job(
+                            job_aviso_previo, "date", run_date=momento,
+                            args=[grupo, minutos],
+                            id=f"{clave_grupo}|previo{minutos}", replace_existing=True,
+                        )
+                if fecha > ahora:
+                    scheduler.add_job(
+                        job_publicacion, "date", run_date=fecha,
+                        args=[grupo], id=f"{clave_grupo}|ahora", replace_existing=True,
+                    )
+            # se marca aunque ya haya pasado (ya_paso): evita reintentar
+            # programar un aviso de "faltan 15 minutos" para algo que
+            # ocurrió hace horas, por ejemplo si el bot estuvo caído.
+            _marcar_programado(estado, clave_grupo)
 
-        categoria = clasificar_evento(ev["titulo"])
-        if categoria.get("alcista_si_sube") is None:
-            # Discurso, actas o similar: no hay cifra que comparar, una
-            # sola nota aclaratoria basta, reintentar no tendría sentido.
-            scheduler.add_job(
-                job_seguimiento_no_comparable, "date",
-                run_date=ev["fecha"] + timedelta(minutes=REINTENTOS_REACCION_MIN[0]),
-                args=[ev], id=f"{clave_base}|seguimiento", replace_existing=True,
-            )
-        else:
-            for idx, minutos_despues in enumerate(REINTENTOS_REACCION_MIN, start=1):
+        # Reintentos de reacción: uno por evento individual dentro del grupo.
+        for ev in grupo:
+            clave_ev = f"{ev['divisa']}|{ev['titulo']}|{ev['fecha'].isoformat()}"
+            if _ya_programado(estado, clave_ev):
+                continue
+            if ev["fecha"] < ahora - timedelta(minutes=ventana_reaccion):
+                _marcar_programado(estado, clave_ev)
+                continue
+            # Mismo bloque de reintentos para cualquier evento: si es un
+            # discurso/actas sin cifra, o si el dato nunca llega,
+            # job_reaccion simplemente no manda nada (ver su docstring).
+            for idx, minutos_despues in enumerate(REINTENTOS_REACCION_MIN):
                 scheduler.add_job(
                     job_reaccion, "date",
                     run_date=ev["fecha"] + timedelta(minutes=minutos_despues),
-                    args=[ev, idx, len(REINTENTOS_REACCION_MIN)],
-                    id=f"{clave_base}|reaccion{idx}", replace_existing=True,
+                    args=[ev], id=f"{clave_ev}|reaccion{idx}", replace_existing=True,
                 )
-
-        _marcar_programado(estado, clave_base)
-        nuevos += 1
+            _marcar_programado(estado, clave_ev)
+            nuevos += 1
 
     _estado_salud["ultima_sincronizacion"] = datetime.now(ZONA_HORARIA).isoformat()
     _estado_salud["avisos_programados_activos"] = len(scheduler.get_jobs())
     log.info(
-        "Sincronización de calendario: %d eventos relevantes, %d nuevos programados.",
-        len(relevantes), nuevos,
+        "Sincronización de calendario: %d eventos relevantes en %d grupos, %d nuevos programados.",
+        len(relevantes), len(grupos), nuevos,
     )
 
 
