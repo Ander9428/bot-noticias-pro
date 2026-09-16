@@ -148,9 +148,9 @@ AVISOS_PREVIOS_MIN = [15, 5]
 # hace 39 horas) y el feed público TODAVÍA no traía el dato "actual". No es
 # fiable asumir que el resultado aparece a los 3 minutos. Por eso, en vez de
 # revisar una sola vez, se reintenta varias veces con espaciado creciente
-# durante media hora; se manda el mensaje en cuanto el dato aparece, o al
-# final de la ventana se avisa honestamente que no llegó (en vez de fingir
-# que sí hay comparación, o quedarse callado para siempre).
+# durante media hora; se manda el mensaje en cuanto el dato aparece. Si tras
+# el último intento nunca llegó (o el evento no es comparable, ej. un
+# discurso), no se manda nada — silencio, no una nota de "no lo conseguí".
 REINTENTOS_REACCION_MIN = [3, 8, 15, 30]
 
 # Cada cuánto se vuelve a consultar el calendario para detectar noticias
@@ -259,6 +259,19 @@ def run_flask():
 # ══════════════════════════════════════════════════════════════════════════
 # 4. OBTENCIÓN DEL CALENDARIO ECONÓMICO REAL
 # ══════════════════════════════════════════════════════════════════════════
+# CACHÉ CORTA: en un día con varios eventos agrupados (ej. la Fed: tasa +
+# proyecciones + comunicado a la misma hora) cada uno programa sus propios
+# 4 reintentos de reacción en los MISMOS minutos después (+3, +8, +15, +30).
+# Sin caché, eso son 3-4 peticiones casi simultáneas al mismo feed gratuito
+# justo en el momento de mayor tráfico -y ya se comprobó en vivo que este
+# feed responde 429 (demasiadas peticiones) bajo uso repetido seguido. Con
+# esta caché, todas esas llamadas que caen dentro de la misma ventana de
+# 90 segundos comparten una sola descarga real.
+_CACHE_CALENDARIO = {"eventos": None, "momento": None}
+_CACHE_TTL_SEGUNDOS = 90
+_lock_cache_calendario = threading.Lock()
+
+
 def obtener_calendario():
     """
     Descarga el calendario económico de la semana en curso y devuelve una
@@ -268,47 +281,63 @@ def obtener_calendario():
 
     Si la descarga falla (caída del servicio, sin internet, etc.) se
     devuelve una lista vacía y se registra el error, para que el bot no
-    se caiga por un problema de red pasajero.
+    se caiga por un problema de red pasajero. Reutiliza el resultado si
+    se pidió hace menos de _CACHE_TTL_SEGUNDOS (ver comentario arriba).
+
+    La descarga ocurre CON el candado tomado (no solo la lectura de la
+    caché): si dos reintentos de reacción caen en el mismo instante -el
+    caso típico de un grupo de la Fed-, el segundo espera a que el primero
+    termine de descargar en vez de disparar su propia petición en paralelo,
+    y al liberarse ya encuentra la caché fresca.
     """
-    try:
-        respuesta = requests.get(
-            URL_CALENDARIO,
-            headers={"User-Agent": "Mozilla/5.0 (bot de alertas personal)"},
-            timeout=20,
-        )
-        respuesta.raise_for_status()
-        datos = respuesta.json()
-    except (requests.RequestException, json.JSONDecodeError) as e:
-        log.error("No se pudo descargar el calendario económico: %s", e)
-        _estado_salud["ultimo_error"] = f"calendario: {e}"
-        return []
+    with _lock_cache_calendario:
+        momento_cache = _CACHE_CALENDARIO["momento"]
+        if momento_cache is not None:
+            edad = (datetime.now(pytz.utc) - momento_cache).total_seconds()
+            if edad < _CACHE_TTL_SEGUNDOS:
+                return _CACHE_CALENDARIO["eventos"]
 
-    eventos = []
-    for item in datos:
-        fecha_texto = item.get("date")
-        if not fecha_texto:
-            continue
         try:
-            fecha = datetime.fromisoformat(fecha_texto)
-        except ValueError:
-            # Formato inesperado en esa fila puntual: se ignora esa fila,
-            # no todo el calendario.
-            continue
-        if fecha.tzinfo is None:
-            fecha = pytz.utc.localize(fecha)
+            respuesta = requests.get(
+                URL_CALENDARIO,
+                headers={"User-Agent": "Mozilla/5.0 (bot de alertas personal)"},
+                timeout=20,
+            )
+            respuesta.raise_for_status()
+            datos = respuesta.json()
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            log.error("No se pudo descargar el calendario económico: %s", e)
+            _estado_salud["ultimo_error"] = f"calendario: {e}"
+            return []
 
-        eventos.append(
-            {
-                "titulo": (item.get("title") or "").strip(),
-                "divisa": (item.get("country") or "").strip().upper(),
-                "impacto": (item.get("impact") or "").strip(),
-                "fecha": fecha,
-                "pronostico": (item.get("forecast") or "").strip(),
-                "anterior": (item.get("previous") or "").strip(),
-                "actual": (item.get("actual") or "").strip(),
-            }
-        )
-    return eventos
+        eventos = []
+        for item in datos:
+            fecha_texto = item.get("date")
+            if not fecha_texto:
+                continue
+            try:
+                fecha = datetime.fromisoformat(fecha_texto)
+            except ValueError:
+                # Formato inesperado en esa fila puntual: se ignora esa fila,
+                # no todo el calendario.
+                continue
+            if fecha.tzinfo is None:
+                fecha = pytz.utc.localize(fecha)
+
+            eventos.append(
+                {
+                    "titulo": (item.get("title") or "").strip(),
+                    "divisa": (item.get("country") or "").strip().upper(),
+                    "impacto": (item.get("impact") or "").strip(),
+                    "fecha": fecha,
+                    "pronostico": (item.get("forecast") or "").strip(),
+                    "anterior": (item.get("previous") or "").strip(),
+                    "actual": (item.get("actual") or "").strip(),
+                }
+            )
+        _CACHE_CALENDARIO["eventos"] = eventos
+        _CACHE_CALENDARIO["momento"] = datetime.now(pytz.utc)
+        return eventos
 
 
 def _nivel_de_relevancia(titulo):
@@ -333,14 +362,28 @@ _PALABRAS_JEFE_BANCO_CENTRAL = ["chair", "president", "governor", " gov ", "chai
 _PALABRAS_NO_ES_EL_JEFE = ["assist", "deputy", "vice", "member"]
 
 
-def _es_jefe_banco_central(titulo):
-    """True solo para el presidente/gobernador/chair (Powell, Lagarde,
-    Bailey, Bullock...), nunca para un adjunto, vice o miembro cualquiera
-    del comité."""
+def _es_jefe_banco_central(titulo, divisa):
+    """True solo para el jefe del banco central que de verdad fija la
+    política de esa divisa (Powell, Lagarde, Bailey, Bullock...), nunca
+    para un adjunto, vice o miembro cualquiera del comité.
+
+    CASO ESPECIAL EUR: la eurozona tiene un banco central POR PAÍS
+    (Bundesbank en Alemania, Banque de France, Banca d'Italia...) pero
+    solo UNO fija la tasa del euro: el BCE. Visto en vivo un día real:
+    "German Buba President Nagel Speaks" pasaba el filtro (tiene
+    "president") con impacto Bajo, tratándose igual que Lagarde -pero el
+    presidente del Bundesbank opina, no decide solo, y su discurso no
+    mueve el mercado como el de la presidenta del BCE. Por eso para EUR
+    no basta con "president"/"governor": el titular debe mencionar
+    explícitamente al BCE."""
     t = f" {(titulo or '').lower()} "
     if any(p in t for p in _PALABRAS_NO_ES_EL_JEFE):
         return False
-    return any(p in t for p in _PALABRAS_JEFE_BANCO_CENTRAL)
+    if not any(p in t for p in _PALABRAS_JEFE_BANCO_CENTRAL):
+        return False
+    if divisa == "EUR" and "ecb" not in t and "bce" not in t:
+        return False
+    return True
 
 
 def eventos_relevantes(eventos, solo_hoy=False):
@@ -363,7 +406,7 @@ def eventos_relevantes(eventos, solo_hoy=False):
         categoria = clasificar_evento(ev["titulo"])
         es_jefe_hablando = (
             categoria.get("nombre") == "Discurso o comparecencia de un banquero central"
-            and _es_jefe_banco_central(ev["titulo"])
+            and _es_jefe_banco_central(ev["titulo"], ev["divisa"])
         )
         if ev["impacto"] not in IMPACTOS_A_MONITOREAR and not es_jefe_hablando:
             continue
@@ -385,7 +428,6 @@ def eventos_relevantes(eventos, solo_hoy=False):
 #                      divisa (la inmensa mayoría). False en los pocos
 #                      indicadores "inversos" (desempleo, solicitudes de
 #                      subsidio): un número más alto ahí es MALA noticia.
-#   explicacion    -> qué es y por qué mueve el mercado, en criollo
 #   razon_alcista / razon_bajista -> el mecanismo económico concreto que
 #                      conecta el resultado con el movimiento de la divisa,
 #                      para no repetir la misma frase en toda noticia.
@@ -408,13 +450,6 @@ CATEGORIAS = {
         "nombre": "Decisión de tasas de interés",
         "nivel": "clave",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Es la noticia de mayor peso del calendario. Una tasa más alta "
-            "atrae capital extranjero que busca mejor rendimiento en bonos "
-            "y depósitos de esa divisa; una tasa más baja lo espanta hacia "
-            "otras monedas. El comunicado y la rueda de prensa posterior "
-            "suelen moverse el par más que la cifra en sí."
-        ),
         "razon_alcista": (
             "al subir (o mantenerse más restrictiva de lo esperado) atrae "
             "capital que persigue mejor rendimiento, lo que fortalece la divisa"
@@ -429,12 +464,6 @@ CATEGORIAS = {
         "nombre": "Producto Interno Bruto (PIB)",
         "nivel": "clave",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Mide cuánto creció (o se contrajo) la economía en el periodo. "
-            "Es un termómetro general: una economía que crece más de lo "
-            "esperado da margen al banco central para mantener tasas altas "
-            "sin temor a frenar demasiado la actividad."
-        ),
         "razon_alcista": "una economía más fuerte de lo esperado da margen al banco central para sostener tasas altas, lo que favorece a la divisa",
         "razon_bajista": "un crecimiento más débil de lo esperado presiona a que el banco central relaje su política, lo que suele debilitar la divisa",
     },
@@ -447,13 +476,6 @@ CATEGORIAS = {
         "nombre": "Inflación (IPC / PCE / PPI)",
         "nivel": "clave",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Mide cuánto subió el costo de vida. Una inflación por encima de "
-            "lo esperado presiona al banco central a mantener o subir tasas "
-            "para enfriar la economía, lo cual en el corto plazo suele "
-            "fortalecer la divisa aunque sea una mala noticia para la "
-            "economía real."
-        ),
         "razon_alcista": "una inflación más alta de lo esperado aumenta la presión para que el banco central mantenga tasas altas, lo que fortalece la divisa en el corto plazo",
         "razon_bajista": "una inflación más baja de lo esperado abre la puerta a recortes de tasas, lo que suele debilitar la divisa",
     },
@@ -462,12 +484,6 @@ CATEGORIAS = {
         "nombre": "Tasa de desempleo",
         "nivel": "clave",
         "alcista_si_sube": False,  # indicador inverso
-        "explicacion": (
-            "Este es de los indicadores que funcionan AL REVÉS: un número "
-            "más ALTO de lo esperado es una mala noticia (más gente sin "
-            "trabajo), no una buena. Un mercado laboral débil presiona al "
-            "banco central a bajar tasas."
-        ),
         "razon_alcista": "una tasa de desempleo más baja de lo esperado muestra un mercado laboral fuerte, lo que sostiene expectativas de tasas altas y fortalece la divisa",
         "razon_bajista": "una tasa de desempleo más alta de lo esperado muestra un mercado laboral débil, lo que presiona a bajar tasas y suele debilitar la divisa",
     },
@@ -480,12 +496,6 @@ CATEGORIAS = {
         "nombre": "Solicitudes de subsidio por desempleo",
         "nivel": "secundario",
         "alcista_si_sube": False,  # indicador inverso
-        "explicacion": (
-            "Cuenta cuánta gente nueva pidió el seguro de desempleo esa "
-            "semana. También es inverso: MÁS solicitudes de las esperadas "
-            "es una señal de que el mercado laboral se está enfriando, "
-            "no una buena noticia."
-        ),
         "razon_alcista": "menos solicitudes de las esperadas confirma un mercado laboral sólido, lo que favorece a la divisa",
         "razon_bajista": "más solicitudes de las esperadas es señal temprana de enfriamiento laboral, lo que suele pesar sobre la divisa",
     },
@@ -498,12 +508,6 @@ CATEGORIAS = {
         "nombre": "Creación de empleo (Nóminas no agrícolas / NFP)",
         "nivel": "clave",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Mide cuántos puestos de trabajo nuevos se crearon. Un mercado "
-            "laboral fuerte sostiene el consumo y da margen al banco "
-            "central para no bajar tasas. Es de las noticias que más "
-            "mechas violentas genera en 1m y 5m nada más publicarse."
-        ),
         "razon_alcista": "más empleos de los esperados confirma una economía sólida y sostiene expectativas de tasas altas, lo que fortalece la divisa",
         "razon_bajista": "menos empleos de los esperados es señal de debilidad económica y anticipa una postura más laxa del banco central, lo que suele debilitar la divisa",
     },
@@ -515,12 +519,6 @@ CATEGORIAS = {
         "nombre": "PMI / ISM (actividad manufacturera o de servicios)",
         "nivel": "clave",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Encuesta a gerentes de compra sobre si el negocio mejora o "
-            "empeora. Por encima de 50 significa expansión, por debajo "
-            "contracción. Se adelanta varias semanas a los datos oficiales "
-            "de PIB, por eso el mercado le presta atención."
-        ),
         "razon_alcista": "un PMI mejor de lo esperado (o por encima de 50) señala expansión económica, lo que favorece a la divisa",
         "razon_bajista": "un PMI peor de lo esperado (o por debajo de 50) señala contracción, lo que suele pesar sobre la divisa",
     },
@@ -529,12 +527,6 @@ CATEGORIAS = {
         "nombre": "Ventas minoristas",
         "nivel": "secundario",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Mide el gasto de los consumidores, que en la mayoría de "
-            "economías desarrolladas es el motor principal del PIB. "
-            "Un consumidor que gasta más de lo esperado es señal de "
-            "confianza económica."
-        ),
         "razon_alcista": "un consumo mayor al esperado sostiene el crecimiento económico, lo que favorece a la divisa",
         "razon_bajista": "un consumo menor al esperado anticipa un crecimiento más débil, lo que suele pesar sobre la divisa",
     },
@@ -543,13 +535,6 @@ CATEGORIAS = {
         "nombre": "Balanza comercial",
         "nivel": "secundario",
         "alcista_si_sube": True,
-        "explicacion": (
-            "La diferencia entre lo que un país exporta e importa. Un "
-            "superávit mayor (o un déficit menor) al esperado significa "
-            "que entra más dinero extranjero al país del que sale, lo que "
-            "en teoría respalda la divisa, aunque su efecto suele ser más "
-            "moderado que el de empleo o inflación."
-        ),
         "razon_alcista": "un mejor saldo comercial de lo esperado implica más entrada neta de divisas extranjeras",
         "razon_bajista": "un peor saldo comercial de lo esperado implica más salida neta de divisas, lo que puede presionar a la baja",
     },
@@ -561,12 +546,6 @@ CATEGORIAS = {
         "nombre": "Confianza / sentimiento del consumidor",
         "nivel": "secundario",
         "alcista_si_sube": True,
-        "explicacion": (
-            "Encuesta directa a los hogares sobre cómo ven su situación "
-            "económica. Un consumidor optimista tiende a gastar más en los "
-            "meses siguientes, así que el dato se usa como adelanto del "
-            "consumo real."
-        ),
         "razon_alcista": "un consumidor más optimista de lo esperado anticipa mayor gasto futuro, lo que favorece a la divisa",
         "razon_bajista": "un consumidor más pesimista de lo esperado anticipa menor gasto futuro, lo que suele pesar sobre la divisa",
     },
@@ -578,11 +557,6 @@ CATEGORIAS = {
         "nombre": "Sector vivienda",
         "nivel": "secundario",
         "alcista_si_sube": True,
-        "explicacion": (
-            "El sector inmobiliario es de los más sensibles a las tasas de "
-            "interés, así que sirve como termómetro indirecto de qué tanto "
-            "está enfriando (o no) la política monetaria a la economía real."
-        ),
         "razon_alcista": "más actividad de la esperada en vivienda sugiere que la economía tolera bien las tasas actuales",
         "razon_bajista": "menos actividad de la esperada en vivienda sugiere que las tasas altas ya están frenando la economía",
     },
@@ -601,14 +575,6 @@ CATEGORIAS = {
         "nombre": "Discurso o comparecencia de un banquero central",
         "nivel": "clave",
         "alcista_si_sube": None,  # no aplica comparación numérica
-        "explicacion": (
-            "No trae una cifra que comparar: el movimiento depende del TONO. "
-            "Si suena más duro de lo esperado sobre la inflación (\"hawkish\"), "
-            "suele fortalecer la divisa. Si suena más preocupado por el "
-            "crecimiento y abierto a bajar tasas (\"dovish\"), suele "
-            "debilitarla. Se recomienda leer el titular de la noticia en "
-            "vivo en vez de operar a ciegas apenas empieza a hablar."
-        ),
         "razon_alcista": None,
         "razon_bajista": None,
     },
@@ -617,12 +583,6 @@ CATEGORIAS = {
         "nombre": "Actas de la última reunión del banco central",
         "nivel": "clave",
         "alcista_si_sube": None,
-        "explicacion": (
-            "Es el detalle de la discusión interna de la última reunión de "
-            "tasas. No trae cifra que comparar: lo que mueve el mercado es "
-            "si el texto revela más o menos preocupación por la inflación "
-            "de lo que el mercado ya tenía asumido."
-        ),
         "razon_alcista": None,
         "razon_bajista": None,
     },
@@ -632,12 +592,6 @@ CATEGORIA_DEFECTO = {
     "nombre": "Noticia de alto impacto",
     "nivel": "descartar",
     "alcista_si_sube": None,
-    "explicacion": (
-        "No es uno de los indicadores más comunes, pero el calendario la "
-        "marca como de alto impacto (\"3 toros\"). Trátala con el mismo "
-        "respeto: protege posiciones abiertas y espera a que el spread se "
-        "normalice antes de buscar entradas nuevas."
-    ),
     "razon_alcista": None,
     "razon_bajista": None,
 }
@@ -691,6 +645,12 @@ def analizar_resultado(evento):
     fundamentada, no un texto genérico. Devuelve None si el dato todavía
     no se ha publicado o la categoría no admite comparación numérica
     (discursos, actas).
+
+    Además compara contra el dato ANTERIOR (no solo contra el pronóstico):
+    si ambas comparaciones apuntan en la misma dirección, es una señal más
+    fuerte (doble confirmación); si el dato anterior era mejor, es una
+    señal mixta que vale la pena marcar en vez de callar. Esto es lectura
+    real de trader, no un dato de más.
     """
     categoria = clasificar_evento(evento.get("titulo", ""))
     if categoria.get("alcista_si_sube") is None:
@@ -710,11 +670,23 @@ def analizar_resultado(evento):
                 "sin sorpresa frente al pronóstico, no debería generar un "
                 "movimiento direccional fuerte por sí solo"
             ),
+            "confirmacion": None,
         }
 
     salio_por_encima = diferencia > 0
     es_alcista = salio_por_encima if categoria["alcista_si_sube"] else not salio_por_encima
     razon = categoria["razon_alcista"] if es_alcista else categoria["razon_bajista"]
+
+    confirmacion = None
+    anterior = _a_numero(evento.get("anterior"))
+    if anterior is not None and abs(actual - anterior) > 1e-9:
+        mejora_vs_anterior = (
+            (actual > anterior) if categoria["alcista_si_sube"] else (actual < anterior)
+        )
+        if mejora_vs_anterior == es_alcista:
+            confirmacion = "doble confirmación: también mejora frente al dato anterior"
+        else:
+            confirmacion = "el dato anterior era mejor: lectura mixta, cautela"
 
     return {
         "resultado_txt": (
@@ -723,6 +695,7 @@ def analizar_resultado(evento):
         ),
         "direccion": "alcista" if es_alcista else "bajista",
         "razon": razon,
+        "confirmacion": confirmacion,
     }
 
 
@@ -865,10 +838,16 @@ def mensaje_previo(grupo, minutos):
     manual ("el PIB mide..."). Lo que sí se quedó, y es más útil que
     antes: qué puede ocasionar el dato para el mercado en los dos sentidos
     posibles, con la MISMA lógica económica real del análisis post-noticia.
-    Solo se agrega en el aviso NO urgente y solo cuando hay una única
-    noticia — con 3-4 indicadores distintos a la vez la lectura neta es
-    genuinamente difícil de anticipar bien, y forzarla daría una
-    conclusión potencialmente equivocada.
+    Solo se agrega en el aviso NO urgente (nunca en el de último minuto,
+    para no repetir el mismo texto dos veces seguidas).
+
+    En un grupo (día de la Fed) se usa la categoría del PRIMER integrante
+    que sí admita comparación numérica -normalmente todos comparten la
+    misma familia ("tasas": la tasa en sí, las proyecciones, el
+    comunicado), así que un solo análisis compartido aplica igual de bien
+    a los tres. Antes esto se omitía por completo para cualquier grupo,
+    dejando sin análisis fundamental justo el momento de más peso del
+    calendario -pediste que eso se corrigiera.
     """
     divisa = grupo[0]["divisa"]
     hora_local = grupo[0]["fecha"].astimezone(ZONA_HORARIA).strftime("%H:%M")
@@ -881,10 +860,17 @@ def mensaje_previo(grupo, minutos):
         titulo = _escapar(traducir_titulo(evento["titulo"]))
         base = (
             f"{emoji} *En {minutos} {palabra_min}:* {titulo} ({divisa})\n"
-            f"Impacto: {traducir_impacto(evento['impacto'])} · {hora_local} (Colombia)\n"
-            f"Pronóstico: {evento['pronostico'] or 'sin dato'} | "
-            f"Anterior: {evento['anterior'] or 'sin dato'}"
+            f"Impacto: {traducir_impacto(evento['impacto'])} · {hora_local} (Colombia)"
         )
+        # Un discurso o unas actas nunca traen pronóstico ni dato anterior
+        # (no es una cifra que comparar) - mostrar "sin dato" en ambos
+        # campos es ruido, no información, así que esa línea solo se
+        # agrega cuando el evento SÍ es de los que traen una cifra.
+        if clasificar_evento(evento["titulo"]).get("alcista_si_sube") is not None:
+            base += (
+                f"\nPronóstico: {evento['pronostico'] or 'sin dato'} | "
+                f"Anterior: {evento['anterior'] or 'sin dato'}"
+            )
     else:
         titulos = "\n".join(
             f"• {_escapar(traducir_titulo(e['titulo']))}" for e in grupo
@@ -894,11 +880,17 @@ def mensaje_previo(grupo, minutos):
             f"{divisa} al mismo tiempo ({hora_local} Colombia):\n{titulos}"
         )
 
-    if es_urgente or len(grupo) > 1:
+    if es_urgente:
         return base
 
-    categoria = clasificar_evento(grupo[0]["titulo"])
-    if categoria.get("alcista_si_sube") is None:
+    categoria = None
+    for ev in grupo:
+        cat = clasificar_evento(ev["titulo"])
+        if cat.get("alcista_si_sube") is not None:
+            categoria = cat
+            break
+
+    if categoria is None:
         analisis = (
             "🧠 No trae una cifra que comparar contra un pronóstico: el "
             "mercado reacciona al TONO del mensaje, no a un número."
@@ -926,6 +918,11 @@ def mensaje_publicacion(grupo):
     if len(grupo) == 1:
         evento = grupo[0]
         titulo = _escapar(traducir_titulo(evento["titulo"]))
+        # Un discurso "empieza", no "se publica" (no trae una cifra que
+        # publicar), así que ni el verbo ni la línea de pronóstico/anterior
+        # aplican - ver el mismo razonamiento en mensaje_previo.
+        if clasificar_evento(evento["titulo"]).get("alcista_si_sube") is None:
+            return f"🎤 *Empezando ahora:* {titulo} ({divisa})"
         return (
             f"💥 *Publicado ahora:* {titulo} ({divisa})\n"
             f"Pronóstico: {evento['pronostico'] or 'sin dato'} | "
@@ -945,10 +942,13 @@ def mensaje_reaccion(evento, analisis):
     """
     titulo = _escapar(traducir_titulo(evento["titulo"]))
     emoji = {"alcista": "🟢", "bajista": "🔴", "neutral": "⚪"}[analisis["direccion"]]
+    linea_lectura = f"Lectura: {analisis['direccion'].upper()} para {evento['divisa']}"
+    if analisis.get("confirmacion"):
+        linea_lectura += f" ({analisis['confirmacion']})"
     return (
         f"{emoji} *{titulo}* ({evento['divisa']}): {evento['actual']} vs "
         f"{evento['pronostico']} esperado · anterior {evento['anterior']}\n"
-        f"Lectura: {analisis['direccion'].upper()} para {evento['divisa']}"
+        f"{linea_lectura}"
     )
 
 
