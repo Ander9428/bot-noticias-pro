@@ -12,13 +12,20 @@ QUÉ CAMBIÉ RESPECTO A TU CÓDIGO ORIGINAL (para que sepas qué esperar):
      y lo vuelve a consultar cada hora para mantenerse actualizado.
 
   2. EL "ANÁLISIS FUNDAMENTAL" ERA UN TEXTO FIJO. Decía lo mismo sin
-     importar si el dato salió bien o mal. Ahora hay dos analisis:
-       - Uno EDUCATIVO antes del dato (qué es, por qué importa) - se amplió
-         de 4 a 12 categorías de noticia.
-       - Uno REAL después del dato: compara el resultado (actual) contra
-         lo esperado (pronóstico) y contra el dato anterior, y te dice si
-         eso es alcista o bajista para la divisa Y POR QUÉ, con la lógica
-         economica correcta (ej: el desempleo funciona al revés que el PIB).
+     importar si el dato salió bien o mal. Ahora hay un análisis real
+     ANTES del dato: qué es, por qué importa, y qué significaría un
+     resultado por encima o por debajo del pronóstico -con la lógica
+     económica correcta para cada categoría (ej: el desempleo funciona al
+     revés que el PIB).
+
+     OJO, ESTO CAMBIÓ DE NUEVO: en la ronda anterior había TAMBIÉN un
+     segundo análisis, DESPUÉS del dato, comparando el resultado real
+     contra el pronóstico. Se probó a fondo -no solo se sospechó, se
+     verificó en vivo contra el feed real- y esa comparación es
+     estructuralmente imposible con datos gratis: ver el punto 7 mas
+     abajo. Se eliminó por completo en vez de dejar una función que nunca
+     iba a disparar; ese era justamente el "texto vacío o falso" que se
+     pidió evitar.
 
   3. NO HABÍA PROGRAMACIÓN DINÁMICA REAL. El código de ejemplo mostraba
      "así programarías una noticia" pero comentado, a mano, una por una.
@@ -38,10 +45,51 @@ QUÉ CAMBIÉ RESPECTO A TU CÓDIGO ORIGINAL (para que sepas qué esperar):
      (Render reinicia los Web Services gratuitos con frecuencia): se
      guarda un registro en disco de qué ya se programó.
 
+  7. SE ELIMINÓ LA COMPARACIÓN "RESULTADO REAL VS. PRONÓSTICO" (Y TODO LO
+     QUE SOLO EXISTÍA PARA SOSTENERLA). Motivo, verificado en vivo, no
+     supuesto:
+       - El feed gratuito de ForexFactory que usa este bot JAMÁS incluye
+         el campo "actual" (el resultado publicado). Se revisaron las 78
+         noticias de una semana real completa, pasadas y futuras: la
+         clave "actual" no aparece en NINGUNA. El código anterior ya
+         intuía el problema (dejó un comentario sobre un evento de hace
+         39 horas sin dato); esta vez se confirmó con el feed completo.
+       - Se probaron 5 fuentes alternativas para conseguir el dato real:
+         la página web de ForexFactory (bloqueada por Cloudflare, error
+         403), TradingEconomics (su acceso de invitado gratuito fue
+         discontinuado, HTTP 410), Finnhub (su calendario económico está
+         bloqueado para el plan gratis), y Myfxbook (sin API pública
+         documentada para esto). Ninguna gratuita funcionó.
+       - Con esto confirmado, mantener la función de "reacción" (el job
+         que reintentaba 4 veces por evento durante 30 minutos buscando
+         un dato que nunca iba a llegar, el registro en disco de
+         reacciones enviadas, la función de comparación, el mensaje de
+         resultado) era codigo muerto: nunca se iba a ejecutar de verdad.
+         Se eliminó todo junto, no se dejó "por si acaso".
+       - Efecto secundario bueno: la caché de 90 segundos del calendario
+         también se eliminó. Solo existía para absorber las ráfagas de
+         3-4 peticiones simultáneas que generaban los reintentos de
+         reacción en un día con varias noticias agrupadas (ej. el Banco
+         Central Suizo). Sin reintentos de reacción, ese patrón de ráfaga
+         ya no ocurre: la sincronización por hora y el reporte diario de
+         las 6 AM nunca coinciden en el tiempo, así que nunca se acercan
+         al límite real del feed (2 peticiones cada 5 minutos).
+
+  8. BUG REAL ENCONTRADO PROBANDO CONTRA EL FEED EN VIVO: "SNB Policy
+     Rate" (decisión de tasas del Banco Nacional Suizo, un evento real
+     programado la semana que se probó) no coincidía con ninguna palabra
+     clave de la categoría "tasas" -el código buscaba "snb rate" pero el
+     título real trae "Policy" en medio ("SNB Policy Rate"). Se estaba
+     descartando en silencio justo el tipo de evento que más importa. Se
+     agregaron los nombres oficiales que usan otros bancos centrales
+     (BOE = "Bank Rate", ECB = "Main Refinancing Rate"/"Deposit Facility
+     Rate") para cerrar el mismo hueco antes de que pase con ellos.
+
 LO QUE SIGUE IGUAL, A PROPÓSITO: Flask como "keep-alive" para Render,
 APScheduler para programar, pytz para la zona horaria de Colombia,
 polling de Telegram al final. Es tu misma arquitectura, solo que ahora
-hace lo que el comentario decía que hacía.
+hace lo que el comentario decía que hacía -y ya no promete lo que la
+fuente de datos gratuita no puede cumplir.
 
 ════════════════════════════════════════════════════════════════════════════
  CONFIGURACIÓN NECESARIA (variables de entorno, NO las escribas en el código)
@@ -137,21 +185,17 @@ INCLUIR_SECUNDARIOS = False
 # ForexFactory para su propio calendario (lo consumen decenas de bots y
 # paneles de trading, no es un endpoint privado ni requiere autenticación).
 # Si algún día cambia de dirección, este es el único lugar que hay que tocar.
+#
+# LÍMITE REAL MEDIDO: este feed acepta como máximo 2 peticiones cada 5
+# minutos (más que eso responde 429). Con la sincronización cada hora y el
+# reporte matutino una vez al día, este bot nunca se acerca a ese límite
+# -no hace falta ninguna caché para protegerlo.
 URL_CALENDARIO = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # Minutos de anticipación de cada aviso antes del evento.
 # El primer aviso llega 15 minutos antes (pediste ese margen); el segundo,
 # 5 minutos antes, como último recordatorio urgente.
 AVISOS_PREVIOS_MIN = [15, 5]
-
-# MEDIDO EN VIVO: se revisaron eventos de alto impacto ya publicados (uno de
-# hace 39 horas) y el feed público TODAVÍA no traía el dato "actual". No es
-# fiable asumir que el resultado aparece a los 3 minutos. Por eso, en vez de
-# revisar una sola vez, se reintenta varias veces con espaciado creciente
-# durante media hora; se manda el mensaje en cuanto el dato aparece. Si tras
-# el último intento nunca llegó (o el evento no es comparable, ej. un
-# discurso), no se manda nada — silencio, no una nota de "no lo conseguí".
-REINTENTOS_REACCION_MIN = [3, 8, 15, 30]
 
 # Cada cuánto se vuelve a consultar el calendario para detectar noticias
 # nuevas o cambios de pronóstico (en minutos).
@@ -178,7 +222,7 @@ _estado_salud = {
 # ══════════════════════════════════════════════════════════════════════════
 # 2. PERSISTENCIA SIMPLE (evita mandar el mismo aviso dos veces)
 # ══════════════════════════════════════════════════════════════════════════
-_ESTADO_DEFECTO = {"programados": [], "reacciones_enviadas": []}
+_ESTADO_DEFECTO = {"programados": []}
 
 
 def _cargar_estado_disco():
@@ -191,7 +235,6 @@ def _cargar_estado_disco():
         log.warning("No se pudo leer %s (%s); se empieza de cero.", ARCHIVO_ESTADO, e)
         return dict(_ESTADO_DEFECTO)
     # por si el archivo viene de una version anterior sin esta clave
-    estado.setdefault("reacciones_enviadas", [])
     estado.setdefault("programados", [])
     return estado
 
@@ -213,26 +256,6 @@ def _marcar_programado(estado, clave):
     # Se conservan solo las últimas 500 claves para que el archivo no
     # crezca sin límite; con eso sobra para varias semanas de cobertura.
     estado["programados"] = estado["programados"][-500:]
-    _guardar_estado_disco(estado)
-
-
-def _ya_reaccion_enviada(clave):
-    """
-    A diferencia de `_ya_programado`, esto SÍ se persiste en disco (antes
-    solo vivía en un set en memoria). Si Render reinicia el proceso a
-    mitad de la ventana de 30 minutos de reintentos -pasa seguido en el
-    plan gratis-, sin esto se podía mandar la MISMA comparación real dos
-    veces. Se lee el archivo fresco en cada llamada porque job_reaccion se
-    dispara pocas veces por evento, el costo es insignificante.
-    """
-    estado = _cargar_estado_disco()
-    return clave in estado["reacciones_enviadas"]
-
-
-def _marcar_reaccion_enviada(clave):
-    estado = _cargar_estado_disco()
-    estado["reacciones_enviadas"].append(clave)
-    estado["reacciones_enviadas"] = estado["reacciones_enviadas"][-500:]
     _guardar_estado_disco(estado)
 
 
@@ -259,85 +282,54 @@ def run_flask():
 # ══════════════════════════════════════════════════════════════════════════
 # 4. OBTENCIÓN DEL CALENDARIO ECONÓMICO REAL
 # ══════════════════════════════════════════════════════════════════════════
-# CACHÉ CORTA: en un día con varios eventos agrupados (ej. la Fed: tasa +
-# proyecciones + comunicado a la misma hora) cada uno programa sus propios
-# 4 reintentos de reacción en los MISMOS minutos después (+3, +8, +15, +30).
-# Sin caché, eso son 3-4 peticiones casi simultáneas al mismo feed gratuito
-# justo en el momento de mayor tráfico -y ya se comprobó en vivo que este
-# feed responde 429 (demasiadas peticiones) bajo uso repetido seguido. Con
-# esta caché, todas esas llamadas que caen dentro de la misma ventana de
-# 90 segundos comparten una sola descarga real.
-_CACHE_CALENDARIO = {"eventos": None, "momento": None}
-_CACHE_TTL_SEGUNDOS = 90
-_lock_cache_calendario = threading.Lock()
-
-
 def obtener_calendario():
     """
     Descarga el calendario económico de la semana en curso y devuelve una
-    lista de diccionarios ya normalizados. Cada entrada del feed trae:
-    title, country, date (ISO con offset horario), impact, forecast,
-    previous, actual (vacío mientras no se haya publicado el dato).
+    lista de diccionarios ya normalizados: titulo, divisa, impacto, fecha,
+    pronostico, anterior.
 
     Si la descarga falla (caída del servicio, sin internet, etc.) se
     devuelve una lista vacía y se registra el error, para que el bot no
-    se caiga por un problema de red pasajero. Reutiliza el resultado si
-    se pidió hace menos de _CACHE_TTL_SEGUNDOS (ver comentario arriba).
-
-    La descarga ocurre CON el candado tomado (no solo la lectura de la
-    caché): si dos reintentos de reacción caen en el mismo instante -el
-    caso típico de un grupo de la Fed-, el segundo espera a que el primero
-    termine de descargar en vez de disparar su propia petición en paralelo,
-    y al liberarse ya encuentra la caché fresca.
+    se caiga por un problema de red pasajero.
     """
-    with _lock_cache_calendario:
-        momento_cache = _CACHE_CALENDARIO["momento"]
-        if momento_cache is not None:
-            edad = (datetime.now(pytz.utc) - momento_cache).total_seconds()
-            if edad < _CACHE_TTL_SEGUNDOS:
-                return _CACHE_CALENDARIO["eventos"]
+    try:
+        respuesta = requests.get(
+            URL_CALENDARIO,
+            headers={"User-Agent": "Mozilla/5.0 (bot de alertas personal)"},
+            timeout=20,
+        )
+        respuesta.raise_for_status()
+        datos = respuesta.json()
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        log.error("No se pudo descargar el calendario económico: %s", e)
+        _estado_salud["ultimo_error"] = f"calendario: {e}"
+        return []
 
+    eventos = []
+    for item in datos:
+        fecha_texto = item.get("date")
+        if not fecha_texto:
+            continue
         try:
-            respuesta = requests.get(
-                URL_CALENDARIO,
-                headers={"User-Agent": "Mozilla/5.0 (bot de alertas personal)"},
-                timeout=20,
-            )
-            respuesta.raise_for_status()
-            datos = respuesta.json()
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            log.error("No se pudo descargar el calendario económico: %s", e)
-            _estado_salud["ultimo_error"] = f"calendario: {e}"
-            return []
+            fecha = datetime.fromisoformat(fecha_texto)
+        except ValueError:
+            # Formato inesperado en esa fila puntual: se ignora esa fila,
+            # no todo el calendario.
+            continue
+        if fecha.tzinfo is None:
+            fecha = pytz.utc.localize(fecha)
 
-        eventos = []
-        for item in datos:
-            fecha_texto = item.get("date")
-            if not fecha_texto:
-                continue
-            try:
-                fecha = datetime.fromisoformat(fecha_texto)
-            except ValueError:
-                # Formato inesperado en esa fila puntual: se ignora esa fila,
-                # no todo el calendario.
-                continue
-            if fecha.tzinfo is None:
-                fecha = pytz.utc.localize(fecha)
-
-            eventos.append(
-                {
-                    "titulo": (item.get("title") or "").strip(),
-                    "divisa": (item.get("country") or "").strip().upper(),
-                    "impacto": (item.get("impact") or "").strip(),
-                    "fecha": fecha,
-                    "pronostico": (item.get("forecast") or "").strip(),
-                    "anterior": (item.get("previous") or "").strip(),
-                    "actual": (item.get("actual") or "").strip(),
-                }
-            )
-        _CACHE_CALENDARIO["eventos"] = eventos
-        _CACHE_CALENDARIO["momento"] = datetime.now(pytz.utc)
-        return eventos
+        eventos.append(
+            {
+                "titulo": (item.get("title") or "").strip(),
+                "divisa": (item.get("country") or "").strip().upper(),
+                "impacto": (item.get("impact") or "").strip(),
+                "fecha": fecha,
+                "pronostico": (item.get("forecast") or "").strip(),
+                "anterior": (item.get("previous") or "").strip(),
+            }
+        )
+    return eventos
 
 
 def _nivel_de_relevancia(titulo):
@@ -352,7 +344,8 @@ def _nivel_de_relevancia(titulo):
 # Bailey suele venir como "Medium", y el de un miembro cualquiera del
 # comité (no el presidente) como "Medium" o "Low" — visto en vivo con
 # "ECB President Lagarde Speaks" (Medium), "RBA Gov Bullock Speaks"
-# (Medium) y "FOMC Member Bowman Speaks" (Low) el mismo día.
+# (High, verificado en vivo) y "FOMC Member Bowman Speaks" (Low) el mismo
+# día.
 #
 # Esto se soluciona distinguiendo PRESIDENTE/GOBERNADOR (el jefe del banco
 # central, cuyas palabras sí mueven el mercado aunque la fuente lo marque
@@ -420,6 +413,9 @@ def eventos_relevantes(eventos, solo_hoy=False):
 
 # ══════════════════════════════════════════════════════════════════════════
 # 5. ANÁLISIS FUNDAMENTAL — motor de clasificación y explicación
+#    (análisis PREVIO al dato: qué es, por qué importa, qué significaría
+#    un resultado por encima o por debajo del pronóstico. Ya no existe un
+#    análisis POSTERIOR -ver el punto 7 de la cabecera del archivo.)
 # ══════════════════════════════════════════════════════════════════════════
 # Cada categoría define:
 #   claves         -> palabras que identifican el titular de la noticia
@@ -446,6 +442,15 @@ CATEGORIAS = {
             "federal funds rate", "official bank rate", "overnight rate",
             "cash rate", "economic projections", "summary of economic projections",
             "dot plot",
+            # BUG REAL encontrado probando contra el feed en vivo: "SNB
+            # Policy Rate" no coincidia con "snb rate" (tiene "Policy" en
+            # medio) y se descartaba en silencio -justo una decision de
+            # tasas real de esta semana. "policy rate" (generico) y los
+            # nombres oficiales que usan otros bancos centrales (BOE =
+            # "Bank Rate", ECB = "Main Refinancing Rate"/"Deposit Facility
+            # Rate") cierran el mismo hueco para todos, no solo para el SNB.
+            "policy rate", "bank rate", "main refinancing rate",
+            "deposit facility rate", "repo rate", "base rate",
         ],
         "nombre": "Decisión de tasas de interés",
         "nivel": "clave",
@@ -623,82 +628,6 @@ def clasificar_evento(titulo):
     return CATEGORIA_DEFECTO
 
 
-def _a_numero(texto):
-    """Convierte '3.2%', '170K', '-0.4B', '1,234' a un float comparable.
-    Se asume que actual/pronóstico/anterior del MISMO evento comparten
-    unidad y sufijo, así que basta con quitarlos igual en ambos lados
-    antes de restar. Devuelve None si no se puede interpretar (dato aún
-    no publicado, o formato inesperado)."""
-    if not texto:
-        return None
-    limpio = texto.strip().replace("%", "").replace(",", "")
-    limpio = limpio.rstrip("KMB")
-    try:
-        return float(limpio)
-    except ValueError:
-        return None
-
-
-def analizar_resultado(evento):
-    """
-    Compara el dato PUBLICADO contra el PRONÓSTICO y arma una lectura
-    fundamentada, no un texto genérico. Devuelve None si el dato todavía
-    no se ha publicado o la categoría no admite comparación numérica
-    (discursos, actas).
-
-    Además compara contra el dato ANTERIOR (no solo contra el pronóstico):
-    si ambas comparaciones apuntan en la misma dirección, es una señal más
-    fuerte (doble confirmación); si el dato anterior era mejor, es una
-    señal mixta que vale la pena marcar en vez de callar. Esto es lectura
-    real de trader, no un dato de más.
-    """
-    categoria = clasificar_evento(evento.get("titulo", ""))
-    if categoria.get("alcista_si_sube") is None:
-        return None
-
-    actual = _a_numero(evento.get("actual"))
-    pronostico = _a_numero(evento.get("pronostico"))
-    if actual is None or pronostico is None:
-        return None
-
-    diferencia = actual - pronostico
-    if abs(diferencia) < 1e-9:
-        return {
-            "resultado_txt": "salió exactamente en línea con lo esperado",
-            "direccion": "neutral",
-            "razon": (
-                "sin sorpresa frente al pronóstico, no debería generar un "
-                "movimiento direccional fuerte por sí solo"
-            ),
-            "confirmacion": None,
-        }
-
-    salio_por_encima = diferencia > 0
-    es_alcista = salio_por_encima if categoria["alcista_si_sube"] else not salio_por_encima
-    razon = categoria["razon_alcista"] if es_alcista else categoria["razon_bajista"]
-
-    confirmacion = None
-    anterior = _a_numero(evento.get("anterior"))
-    if anterior is not None and abs(actual - anterior) > 1e-9:
-        mejora_vs_anterior = (
-            (actual > anterior) if categoria["alcista_si_sube"] else (actual < anterior)
-        )
-        if mejora_vs_anterior == es_alcista:
-            confirmacion = "doble confirmación: también mejora frente al dato anterior"
-        else:
-            confirmacion = "el dato anterior era mejor: lectura mixta, cautela"
-
-    return {
-        "resultado_txt": (
-            "salió por ENCIMA de lo esperado" if salio_por_encima
-            else "salió por DEBAJO de lo esperado"
-        ),
-        "direccion": "alcista" if es_alcista else "bajista",
-        "razon": razon,
-        "confirmacion": confirmacion,
-    }
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # 6. CONSTRUCCIÓN DE MENSAJES  ·  todo en español, incluido lo que el feed
 #    entrega en inglés (nivel de impacto y nombre de la noticia)
@@ -772,11 +701,17 @@ _TRADUCCIONES_TITULO = [
     (r"\bOfficial Bank Rate\b", "Tasa Oficial del Banco"),
     (r"\bOvernight Rate\b", "Tasa Overnight"),
     (r"\bCash Rate\b", "Tasa de Efectivo"),
+    (r"\bSNB Policy Rate\b", "Tasa de Política del SNB"),
+    (r"\bPolicy Rate\b", "Tasa de Política"),
+    (r"\bBank Rate\b", "Tasa Bancaria"),
+    (r"\bMain Refinancing Rate\b", "Tasa de Refinanciación Principal"),
+    (r"\bDeposit Facility Rate\b", "Tasa de Depósito"),
     (r"\bFOMC Statement\b", "Comunicado del FOMC"),
     (r"\bFOMC Meeting Minutes\b", "Actas de la Reunión del FOMC"),
     (r"\bFOMC Press Conference\b", "Rueda de Prensa del FOMC"),
     (r"\bMonetary Policy Statement\b", "Comunicado de Política Monetaria"),
     (r"\bMonetary Policy Report\b", "Informe de Política Monetaria"),
+    (r"\bMonetary Policy Assessment\b", "Evaluación de Política Monetaria"),
     (r"\bRate Statement\b", "Comunicado de Tasas"),
     (r"\bPress Conference\b", "Rueda de Prensa"),
     (r"\bSpeaks\b", "habla"),
@@ -869,20 +804,12 @@ def mensaje_previo(grupo, minutos):
     agrupan en uno solo. El caso normal (1 sola noticia) se ve exactamente
     igual que antes.
 
-    Se quitó el consejo de trading ("asegura tu stop") y la definición de
-    manual ("el PIB mide..."). Lo que sí se quedó, y es más útil que
-    antes: qué puede ocasionar el dato para el mercado en los dos sentidos
-    posibles, con la MISMA lógica económica real del análisis post-noticia.
-    Solo se agrega en el aviso NO urgente (nunca en el de último minuto,
-    para no repetir el mismo texto dos veces seguidas).
-
-    En un grupo (día de la Fed) se usa la categoría del PRIMER integrante
-    que sí admita comparación numérica -normalmente todos comparten la
-    misma familia ("tasas": la tasa en sí, las proyecciones, el
-    comunicado), así que un solo análisis compartido aplica igual de bien
-    a los tres. Antes esto se omitía por completo para cualquier grupo,
-    dejando sin análisis fundamental justo el momento de más peso del
-    calendario -pediste que eso se corrigiera.
+    En un grupo (día de la Fed o del SNB) se usa la categoría de cada
+    integrante que sí admita comparación numérica -si el grupo mezcla mas
+    de una categoria con logica distinta (ej. Empleo + Tasa de Desempleo
+    el mismo minuto, que funcionan AL REVES una de otra), se da una linea
+    de razonamiento por cada una en vez de una conclusion unica que solo
+    seria cierta para la mitad del grupo.
     """
     divisa = grupo[0]["divisa"]
     bandera = _bandera(divisa)
@@ -921,17 +848,6 @@ def mensaje_previo(grupo, minutos):
     if es_urgente:
         return base
 
-    # Categorías DISTINTAS del grupo que sí admiten comparación numérica.
-    # No basta con tomar "la primera que aparezca": el reporte de empleo
-    # de EEUU publica Nóminas (NFP, normal: más alto es alcista) y Tasa de
-    # Desempleo (inversa: más alto es bajista) EN EL MISMO instante todos
-    # los meses. Si se tomara la lógica de una sola para las dos, la mitad
-    # de las veces la lectura sería la contraria a la real -se comprobó
-    # armando ese caso exacto: con NFP primero en la lista, el análisis
-    # decía "alcista" sin aclarar que la Tasa de Desempleo funciona al
-    # revés. Por eso, si el grupo mezcla más de una categoría distinta, se
-    # da una línea de razonamiento por cada una en vez de una conclusión
-    # única que solo sería cierta para la mitad del grupo.
     categorias_comparables = []
     nombres_vistos = set()
     for ev in grupo:
@@ -994,28 +910,6 @@ def mensaje_publicacion(grupo):
     return f"💥 *Publicado ahora ({bandera} {divisa}):* {icono} {len(grupo)} noticias a la vez\n{titulos}"
 
 
-def mensaje_reaccion(evento, analisis):
-    """
-    Solo se llama cuando SÍ hay un resultado real que mostrar. Si el
-    calendario nunca publica el dato 'actual' (pasa con este feed gratis),
-    o el evento es un discurso/actas sin cifra que comparar, `job_reaccion`
-    nunca invoca esta función y no se manda nada — pediste exactamente
-    eso: si no hay resultado, silencio, no una nota diciendo que no llegó.
-    """
-    titulo = _escapar(traducir_titulo(evento["titulo"]))
-    bandera = _bandera(evento["divisa"])
-    icono = _emoji_categoria(evento["titulo"])
-    emoji = {"alcista": "🟢", "bajista": "🔴", "neutral": "⚪"}[analisis["direccion"]]
-    linea_lectura = f"Lectura: {analisis['direccion'].upper()} para {bandera} {evento['divisa']}"
-    if analisis.get("confirmacion"):
-        linea_lectura += f" ({analisis['confirmacion']})"
-    return (
-        f"{emoji} *{icono} {titulo}* ({bandera} {evento['divisa']}): {evento['actual']} vs "
-        f"{evento['pronostico']} esperado · anterior {evento['anterior']}\n"
-        f"{linea_lectura}"
-    )
-
-
 def mensaje_reporte_matutino(eventos_hoy):
     if not eventos_hoy:
         return (
@@ -1057,46 +951,6 @@ def job_publicacion(grupo):
     _enviar(mensaje_publicacion(grupo))
 
 
-def _clave_reaccion(evento):
-    return f"{evento['divisa']}|{evento['titulo']}|{evento['fecha'].isoformat()}"
-
-
-def job_reaccion(evento):
-    """
-    Se llama varias veces por evento (ver REINTENTOS_REACCION_MIN), no una
-    sola. En cada llamada vuelve a descargar el calendario completo (el
-    'actual' puede tardar en aparecer) y compara contra el pronóstico.
-
-    - Si ya se mandó la comparación en un intento anterior, no hace nada
-      (esto se guarda EN DISCO, no solo en memoria, para que sobreviva a
-      un reinicio de Render a mitad de la ventana de 30 minutos).
-    - Si consigue el dato, manda el resultado real UNA vez y no vuelve a
-      intentar.
-    - Si no hay dato (todavía no se publicó, nunca se publica en este feed
-      gratis, o el evento es un discurso/actas sin cifra que comparar), NO
-      SE MANDA NADA. Pediste exactamente eso: si no hay resultado, silencio,
-      nunca una nota diciendo "no lo conseguí, ve a verificar tú mismo".
-    """
-    clave = _clave_reaccion(evento)
-    if _ya_reaccion_enviada(clave):
-        return
-
-    eventos_frescos = obtener_calendario()
-    actualizado = evento
-    for ev in eventos_frescos:
-        if ev["titulo"] == evento["titulo"] and ev["divisa"] == evento["divisa"] \
-                and ev["fecha"] == evento["fecha"]:
-            actualizado = ev
-            break
-
-    analisis = analizar_resultado(actualizado)
-    if analisis is None:
-        return  # sin dato (o no comparable): silencio, se reintenta despues
-
-    _marcar_reaccion_enviada(clave)
-    _enviar(mensaje_reaccion(actualizado, analisis))
-
-
 def job_reporte_matutino():
     eventos = obtener_calendario()
     hoy = eventos_relevantes(eventos, solo_hoy=True)
@@ -1115,25 +969,18 @@ def sincronizar_calendario():
     Se ejecuta al arrancar y luego cada INTERVALO_SINCRONIZACION_MIN.
     Descarga el calendario, filtra tus divisas y el impacto que
     monitoreas, y programa (si no estaban programados ya) los avisos de
-    cada noticia futura: 15 min antes, 5 min antes, al momento, y la
-    comparación real del resultado (con reintentos hasta 30 minutos
-    después; si nunca hay dato que comparar, no se manda nada — ver
-    job_reaccion).
+    cada noticia futura: 15 min antes, 5 min antes, y al momento.
 
-    Los avisos previos y el de publicación se programan por GRUPO, no por
-    evento individual: si dos o más noticias de la misma divisa caen en el
-    minuto exacto (típico en día de la Fed: tasa + proyecciones +
-    comunicado a las 13:00 en punto), se manda un solo aviso combinado en
-    vez de uno por cada una. La comparación real del resultado (reacción)
-    sí se maneja por evento individual, porque cada indicador tiene su
-    propio número que comparar y agruparlos ahí perdería información en
-    vez de solo reducir ruido.
+    Los avisos se programan por GRUPO, no por evento individual: si dos o
+    más noticias de la misma divisa caen en el minuto exacto (típico en
+    día de la Fed o del SNB: tasa + proyecciones/evaluación + comunicado
+    a la misma hora), se manda un solo aviso combinado en vez de uno por
+    cada una.
     """
     ahora = datetime.now(pytz.utc)
     estado = _cargar_estado_disco()
     eventos = obtener_calendario()
     relevantes = eventos_relevantes(eventos, solo_hoy=False)
-    ventana_reaccion = max(REINTENTOS_REACCION_MIN)
 
     grupos = {}
     for ev in relevantes:
@@ -1142,47 +989,27 @@ def sincronizar_calendario():
     nuevos = 0
     for (divisa, fecha), grupo in grupos.items():
         clave_grupo = f"{divisa}|{fecha.isoformat()}|grupo"
-        ya_paso = fecha < ahora - timedelta(minutes=ventana_reaccion)
+        if _ya_programado(estado, clave_grupo):
+            continue
 
-        if not _ya_programado(estado, clave_grupo):
-            if not ya_paso:
-                for minutos in AVISOS_PREVIOS_MIN:
-                    momento = fecha - timedelta(minutes=minutos)
-                    if momento > ahora:
-                        scheduler.add_job(
-                            job_aviso_previo, "date", run_date=momento,
-                            args=[grupo, minutos],
-                            id=f"{clave_grupo}|previo{minutos}", replace_existing=True,
-                        )
-                if fecha > ahora:
+        # se marca aunque ya haya pasado: evita reintentar programar un
+        # aviso de "faltan 15 minutos" para algo que ocurrió hace horas,
+        # por ejemplo si el bot estuvo caído.
+        if fecha > ahora:
+            for minutos in AVISOS_PREVIOS_MIN:
+                momento = fecha - timedelta(minutes=minutos)
+                if momento > ahora:
                     scheduler.add_job(
-                        job_publicacion, "date", run_date=fecha,
-                        args=[grupo], id=f"{clave_grupo}|ahora", replace_existing=True,
+                        job_aviso_previo, "date", run_date=momento,
+                        args=[grupo, minutos],
+                        id=f"{clave_grupo}|previo{minutos}", replace_existing=True,
                     )
-            # se marca aunque ya haya pasado (ya_paso): evita reintentar
-            # programar un aviso de "faltan 15 minutos" para algo que
-            # ocurrió hace horas, por ejemplo si el bot estuvo caído.
-            _marcar_programado(estado, clave_grupo)
-
-        # Reintentos de reacción: uno por evento individual dentro del grupo.
-        for ev in grupo:
-            clave_ev = f"{ev['divisa']}|{ev['titulo']}|{ev['fecha'].isoformat()}"
-            if _ya_programado(estado, clave_ev):
-                continue
-            if ev["fecha"] < ahora - timedelta(minutes=ventana_reaccion):
-                _marcar_programado(estado, clave_ev)
-                continue
-            # Mismo bloque de reintentos para cualquier evento: si es un
-            # discurso/actas sin cifra, o si el dato nunca llega,
-            # job_reaccion simplemente no manda nada (ver su docstring).
-            for idx, minutos_despues in enumerate(REINTENTOS_REACCION_MIN):
-                scheduler.add_job(
-                    job_reaccion, "date",
-                    run_date=ev["fecha"] + timedelta(minutes=minutos_despues),
-                    args=[ev], id=f"{clave_ev}|reaccion{idx}", replace_existing=True,
-                )
-            _marcar_programado(estado, clave_ev)
+            scheduler.add_job(
+                job_publicacion, "date", run_date=fecha,
+                args=[grupo], id=f"{clave_grupo}|ahora", replace_existing=True,
+            )
             nuevos += 1
+        _marcar_programado(estado, clave_grupo)
 
     _estado_salud["ultima_sincronizacion"] = datetime.now(ZONA_HORARIA).isoformat()
     _estado_salud["avisos_programados_activos"] = len(scheduler.get_jobs())
